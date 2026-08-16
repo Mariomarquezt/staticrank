@@ -1,0 +1,300 @@
+/**
+ * Page-content source for the editor panel's content analysis (task 2.5).
+ *
+ * CONTENT SOURCE DECISION — option (a), live tree serialization:
+ * the editor store's `site.pages[]` entries ARE full `Page` objects — a
+ * NodeTree (flat `nodes` map + `rootNodeId`) plus metadata (vendor/Instatic
+ * src/core/page-tree/page.ts:30-53, hydrated from data rows by
+ * src/core/data/pageFromRow.ts:38-73). The panel already reads them through
+ * `useEditorStore` (`editor.store.read` grant), so the DRAFT content is
+ * available client-side with live updates — no publish round-trip, no
+ * staleness. This module walks that tree and emits lightweight semantic
+ * HTML shaped for `server/lib/analysis` (`parseHtml` in
+ * server/lib/analysis/extract.ts: block tags = paragraph boundaries,
+ * h1–h6 = headings, `<a href>` = links, `<img>` = images).
+ *
+ * The rejected alternatives:
+ *   (b) fetching the published page HTML (same-origin — the vite dev server
+ *       proxies public-site requests to the CMS, vendor/Instatic
+ *       vite.config.ts `instatic-public-site-dev-proxy`) reflects the LAST
+ *       PUBLISH, not the draft being edited, and 404s for never-published
+ *       pages;
+ *   (c) no content at all (title/description/keyword checks only) — kept as
+ *       the RUNTIME FALLBACK when serialization fails.
+ *
+ * Honesty caveat baked into the serialized shape: image ALT text is not in
+ * the page tree — the media library asset is the single source of truth,
+ * resolved server-side at render time (vendor/Instatic
+ * src/modules/base/image/index.ts:181-187; ImagePropsSchema has no alt
+ * field, src/modules/base/image/props.ts:4-16). Serialized `<img>` tags
+ * therefore carry only `src`, and the VIEW layer (analysisView.ts) treats
+ * alt- and dimension-dependent results as unknowable for this source
+ * instead of reporting false "missing alt" findings.
+ *
+ * Module coverage mirrors what the publisher emits as indexable text
+ * (module prop shapes: vendor/Instatic src/modules/base/&#42;/props.ts):
+ *   base.text   → `<tag>` from props.tag (p / h1–h6 / span / div / small /
+ *                 strong / em), newlines become <br> (textToBreakHtml
+ *                 semantics); tag 'none' = bare text CONCATENATED with its
+ *                 siblings, no invented boundary (the publisher emits the
+ *                 escaped text verbatim — src/modules/base/text/index.ts:75-79)
+ *   base.list   → <ul>/<ol> + <li> per non-empty line of props.items
+ *                 (split rule: src/modules/base/list/items.ts:17-21)
+ *   base.link   → <a href>…children…</a>, falling back to props.text only
+ *                 when the link has no rendered children — mirroring
+ *                 linkUsesChildren in src/modules/base/link/index.ts
+ *   base.button → <a href>label</a> (or <span>label</span> without href)
+ *   base.image  → <img src> (skipped when src is empty, matching render)
+ *   base.body / base.container / base.slot-instance → <div> wrapper around
+ *                 children (block boundary). Slot-instance children are the
+ *                 REAL slot-fill nodes materialized in the consumer page's
+ *                 tree (src/modules/base/slotInstance/index.ts:1-18), so
+ *                 they analyze like any other page content.
+ *
+ * NOT analyzable — reported via `partial` / `skippedCount` instead of
+ * being silently mis-scored:
+ *   base.visual-component-ref → its slot-instance CHILDREN are analyzed
+ *                 (they live in the page tree), but the VC's own definition
+ *                 tree does not exist in the page and would need the
+ *                 publisher's VC/outlet pairing to materialize — counted
+ *                 as a skipped section.
+ *   base.loop   → repeats a template over data rows resolved at publish
+ *                 time; the page tree holds only the unbound template —
+ *                 skipped entirely, counted.
+ *   unknown module ids with children → the publisher drops unknown modules
+ *                 (renderNode.ts:307-310 emits only a comment); skipped and
+ *                 counted. Childless unknown leaves (svg, video, …)
+ *                 contribute no analyzable text and are silently ignored.
+ *
+ * `hidden: true` nodes are skipped — the publisher does the same
+ * (vendor/Instatic src/core/publisher/renderNode.ts:304).
+ *
+ * Pure TypeScript, no React, no SDK imports — unit-tests under plain
+ * `bun test` and bundles into the browser editor bundle unchanged.
+ */
+
+// ---------------------------------------------------------------------------
+// Structural input types (the panel casts the store's Page down to this)
+// ---------------------------------------------------------------------------
+
+export interface ContentTreeNode {
+  moduleId: string
+  props?: Record<string, unknown>
+  children?: string[]
+  hidden?: boolean
+}
+
+export interface ContentTree {
+  nodes: Record<string, ContentTreeNode>
+  rootNodeId: string
+}
+
+// ---------------------------------------------------------------------------
+// Escaping
+// ---------------------------------------------------------------------------
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/** Escaped text with authored newlines as `<br>` (textToBreakHtml parity). */
+function textToHtml(value: string): string {
+  return escapeHtml(value).replace(/\r\n|\r|\n/g, '<br>')
+}
+
+// ---------------------------------------------------------------------------
+// base.text tag normalization (mirror of src/modules/base/text/tags.ts)
+// ---------------------------------------------------------------------------
+
+const TEXT_TAGS = new Set([
+  'p',
+  'none',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'span',
+  'div',
+  'small',
+  'strong',
+  'em',
+])
+
+function normalizeTextTag(raw: unknown): string {
+  return typeof raw === 'string' && TEXT_TAGS.has(raw) ? raw : 'p'
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+function stringProp(props: Record<string, unknown> | undefined, key: string): string {
+  const value = props?.[key]
+  return typeof value === 'string' ? value : ''
+}
+
+/** Non-empty-line split for base.list items (items.ts parity). */
+function splitListItems(raw: string): string[] {
+  return raw
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}
+
+/** Structural modules whose children are plain page content. */
+const RECURSE_MODULES = new Set(['base.body', 'base.container', 'base.slot-instance'])
+
+/** Known leaf modules that legitimately contribute no analyzable text. */
+const SILENT_LEAF_MODULES = new Set(['base.svg', 'base.video', 'base.slot-outlet'])
+
+interface SerializeState {
+  visited: Set<string>
+  /** Sections whose content cannot be analyzed from the tree (VC/loop/unknown). */
+  skippedCount: number
+}
+
+function serializeChildren(
+  tree: ContentTree,
+  children: string[],
+  state: SerializeState,
+): string {
+  const inner: string[] = []
+  for (const childId of children) serializeNode(tree, childId, state, inner)
+  return inner.join('')
+}
+
+function serializeNode(
+  tree: ContentTree,
+  nodeId: string,
+  state: SerializeState,
+  out: string[],
+): void {
+  // Cycle / duplicate guard: a corrupt tree must never loop the panel.
+  if (state.visited.has(nodeId)) return
+  state.visited.add(nodeId)
+  const node = tree.nodes[nodeId]
+  if (node === undefined || node.hidden === true) return
+
+  const props = node.props
+
+  switch (node.moduleId) {
+    case 'base.text': {
+      const text = stringProp(props, 'text')
+      if (text === '') return
+      const tag = normalizeTextTag(props?.tag)
+      if (tag === 'none') {
+        // Publisher parity (text/index.ts:75-79): a no-wrapper text node
+        // emits the escaped text VERBATIM — no invented boundary, so
+        // adjacent bare nodes concatenate exactly like the published DOM.
+        out.push(escapeHtml(text))
+        return
+      }
+      out.push(`<${tag}>${textToHtml(text)}</${tag}>`)
+      return
+    }
+    case 'base.list': {
+      const items = splitListItems(stringProp(props, 'items'))
+      if (items.length === 0) return
+      const tag = props?.listType === 'ordered' ? 'ol' : 'ul'
+      out.push(`<${tag}>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</${tag}>`)
+      return
+    }
+    case 'base.link': {
+      // Children-first, exactly like the renderer's linkUsesChildren guard
+      // (link/index.ts): props.text is the fallback when no children render.
+      const href = stringProp(props, 'href')
+      const inner = serializeChildren(tree, node.children ?? [], state)
+      const content = inner !== '' ? inner : textToHtml(stringProp(props, 'text'))
+      if (href === '' && content === '') return
+      out.push(`<a href="${escapeHtml(href)}">${content}</a>`)
+      return
+    }
+    case 'base.button': {
+      const label = stringProp(props, 'label')
+      const href = stringProp(props, 'href')
+      if (label === '') return
+      if (href !== '') {
+        out.push(`<a href="${escapeHtml(href)}">${textToHtml(label)}</a>`)
+      } else {
+        out.push(`<span>${textToHtml(label)}</span>`)
+      }
+      return
+    }
+    case 'base.image': {
+      const src = stringProp(props, 'src')
+      // The renderer emits nothing for an empty src (image/index.ts render).
+      // NOTE: no alt on purpose — alt lives in the media library, not the
+      // tree; analysisView treats it as unknowable for this source.
+      if (src === '') return
+      out.push(`<img src="${escapeHtml(src)}">`)
+      return
+    }
+    case 'base.visual-component-ref': {
+      // The VC's own definition tree is NOT in the page and would need the
+      // publisher's outlet pairing to materialize — count it as a skipped
+      // section. Its slot-instance children ARE materialized page-tree
+      // nodes (slotInstance/index.ts:1-18), so the slot FILLS analyze.
+      state.skippedCount += 1
+      const inner = serializeChildren(tree, node.children ?? [], state)
+      if (inner !== '') out.push(`<div>${inner}</div>`)
+      return
+    }
+    case 'base.loop': {
+      // Loop children are an unbound template repeated over data rows at
+      // publish time — analyzing the raw template would mis-score both
+      // word counts and keyword density. Skip entirely, count.
+      state.skippedCount += 1
+      return
+    }
+    default: {
+      if (RECURSE_MODULES.has(node.moduleId)) {
+        const inner = serializeChildren(tree, node.children ?? [], state)
+        if (inner !== '') out.push(`<div>${inner}</div>`)
+        return
+      }
+      // Unknown modules: the publisher drops them (renderNode.ts:307-310),
+      // so recursing would analyze content that never publishes. A node
+      // WITH children is a potential content container → counted as a
+      // skipped section; a childless leaf (and the known text-free leaves)
+      // contributes nothing either way.
+      if (!SILENT_LEAF_MODULES.has(node.moduleId) && (node.children ?? []).length > 0) {
+        state.skippedCount += 1
+      }
+      return
+    }
+  }
+}
+
+export interface SerializedPageContent {
+  html: string
+  /** True when at least one section could not be analyzed from the tree. */
+  partial: boolean
+  /** Number of skipped sections (VC refs, loops, unknown content modules). */
+  skippedCount: number
+}
+
+/**
+ * Serialize a page tree to analysis-shaped HTML. Returns `null` when the
+ * tree is structurally unusable (missing root) — the caller then degrades
+ * to the no-content analysis mode. An EMPTY page serializes to
+ * `html: ''`, which is a valid (all-content-checks-fail) analysis input,
+ * not an error. `partial`/`skippedCount` report sections whose content is
+ * not representable from the tree (see the module header) — content
+ * checks stay scored on what IS analyzable; the view renders an explicit
+ * note instead of blanket-na.
+ */
+export function serializePageContent(tree: ContentTree): SerializedPageContent | null {
+  if (typeof tree.rootNodeId !== 'string' || tree.nodes[tree.rootNodeId] === undefined) {
+    return null
+  }
+  const state: SerializeState = { visited: new Set(), skippedCount: 0 }
+  const out: string[] = []
+  serializeNode(tree, tree.rootNodeId, state, out)
+  return { html: out.join(''), partial: state.skippedCount > 0, skippedCount: state.skippedCount }
+}
