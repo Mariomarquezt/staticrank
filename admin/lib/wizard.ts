@@ -16,7 +16,7 @@
  * concrete benefit>", locked-in-place, zero ads).
  */
 
-import type { SeoConfigData } from '../../server/seoConfig'
+import { indexNowEnabled, schemaEnabled, type SeoConfigData } from '../../server/seoConfig'
 import { normalizeSiteOrigin } from '../../server/metaBlock'
 import { runtimeBasePath } from './identity'
 
@@ -148,9 +148,9 @@ export function buildSetupAudit(config: SeoConfigData): SetupAuditItem[] {
   const templateOk =
     (site.titleTemplate ?? '').trim() !== '' ||
     Object.keys(config.tables ?? {}).length > 0
-  const indexNowToggleOn = config.indexNow?.enabled !== false
+  const indexNowToggleOn = indexNowEnabled(config)
   const indexNowOk = indexNowToggleOn && siteUrlOk
-  const schemaOn = config.schema?.enabled !== false
+  const schemaOn = schemaEnabled(config)
   const publisherOk = schemaOn && (config.schema?.publisherName ?? '').trim() !== ''
   const verification = config.verification ?? {}
   const verificationOk =

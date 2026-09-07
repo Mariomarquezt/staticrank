@@ -142,7 +142,8 @@ export async function getTemplatePageInfo(
   if (cache === null || now >= cache.expiresAt) {
     cache = { infos: new Map(), expiresAt: now + TEMPLATE_FLAG_CACHE_TTL_MS }
   }
-  const cached = cache.infos.get(pageId)
+  const generation = cache
+  const cached = generation.infos.get(pageId)
   if (cached !== undefined) return cached
 
   let info: TemplatePageInfo
@@ -166,7 +167,9 @@ export async function getTemplatePageInfo(
   } catch {
     info = { isTemplate: true }
   }
-  cache.infos.set(pageId, info)
+  // The lookup may have crossed a TTL boundary while awaiting storage. Do
+  // not let the expired generation write into the replacement cache.
+  if (cache === generation) generation.infos.set(pageId, info)
   return info
 }
 

@@ -19,6 +19,7 @@
  */
 
 import { normalizeSiteOrigin, resolveAbsoluteUrl } from '../../server/metaBlock'
+import type { TwitterCard } from '../../server/seoMeta'
 import { truncateAtWordBoundary } from '../../admin/lib/serp'
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,13 @@ export interface SocialCardInput {
   ogDescription?: string
   /** Stored og:image URL — absolute or site-relative; may be empty. */
   ogImage?: string
+  /**
+   * Stored `twitter:card` override. Per-entry only — never templated,
+   * never defaulted (server/metaBlock.ts:379): publish emits the tag ONLY
+   * when it is stored, so an absent value keeps the preview on the large
+   * card this mock has always shown.
+   */
+  twitterCard?: TwitterCard
   /** Bare site origin ('' when unconfigured). */
   siteUrl: string
 }
@@ -99,6 +107,13 @@ export interface SocialCard {
   fbDescription: string
   xTitle: string
   xDescription: string
+  /**
+   * Which X layout the stored meta would actually produce: `'summary'` is
+   * the small square-thumbnail card, `'summary_large_image'` the wide one.
+   * Reads the stored `twitterCard` so a page configured for the small card
+   * never previews as something X will not show (t4-39).
+   */
+  xCard: TwitterCard
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -164,5 +179,8 @@ export function resolveSocialCard(input: SocialCardInput): SocialCard {
     fbDescription: fb.description,
     xTitle: x.title,
     xDescription: x.description,
+    // Unset = the large card, matching what this mock has always shown and
+    // what the head bake leaves to X's own default (no tag is emitted).
+    xCard: input.twitterCard === 'summary' ? 'summary' : 'summary_large_image',
   }
 }

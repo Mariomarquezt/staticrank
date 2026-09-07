@@ -41,6 +41,13 @@
  * link already settles the internal check. mailto:/tel:/javascript:/#… are
  * ignored entirely.
  *
+ * Word/sentence measurement: title and description lengths are measured on the
+ * value AS RENDERED (zero-width characters dropped, whitespace collapsed,
+ * trimmed) so the existence and length halves of a check never disagree. Word
+ * counts and sentence splitting are CJK-aware — an unspaced CJK run counts as
+ * ~1 word per 2 characters and `。！？` end a sentence — while spaced scripts
+ * measure exactly as before.
+ *
  * Keyword aggregation: each keyword check runs once per focus keyword; the
  * reported CheckResult carries the MEAN score across keywords and a status
  * derived from earned/available (>=90% good, >=50% ok, else bad; all-na = na).
@@ -274,9 +281,30 @@ function codePointLength(s: string): number {
   return n
 }
 
+/**
+ * Zero-width / invisible formatting characters: present in the string but
+ * absent from the rendered SERP snippet, so they must not satisfy an
+ * existence check nor inflate a length measurement.
+ */
+const ZERO_WIDTH_RE = /[\u200B-\u200F\u2060\uFEFF]/g
+
+/**
+ * The value AS A SEARCH ENGINE WOULD SHOW IT: zero-width characters dropped,
+ * whitespace runs collapsed, ends trimmed.
+ *
+ * The existence and length halves of these checks must measure the SAME
+ * string. They used to disagree — `exists` tested `trim()` while the length
+ * measured the RAW value — so 20 leading spaces plus an 11-character title
+ * scored the 30–60 "sweet spot", and a zero-width-only title passed
+ * `title-exists`.
+ */
+function measuredValue(value: string): string {
+  return value.replace(ZERO_WIDTH_RE, '').replace(/\s+/g, ' ').trim()
+}
+
 export function runTitleChecks(doc: DocContext): CheckResult[] {
-  const title = doc.title ?? ''
-  const exists = title.trim().length > 0
+  const title = measuredValue(doc.title ?? '')
+  const exists = title.length > 0
   const out: CheckResult[] = [
     exists
       ? result('title-exists', GROUP_TITLE, 'good', 2, 2, 'An SEO title is set.')
@@ -298,8 +326,8 @@ export function runTitleChecks(doc: DocContext): CheckResult[] {
 }
 
 export function runDescriptionChecks(doc: DocContext): CheckResult[] {
-  const desc = doc.metaDescription ?? ''
-  const exists = desc.trim().length > 0
+  const desc = measuredValue(doc.metaDescription ?? '')
+  const exists = desc.length > 0
   const out: CheckResult[] = [
     exists
       ? result('description-exists', GROUP_DESCRIPTION, 'good', 2, 2, 'A meta description is set.')
@@ -318,6 +346,110 @@ export function runDescriptionChecks(doc: DocContext): CheckResult[] {
     out.push(result('description-length', GROUP_DESCRIPTION, 'ok', 2, 4, `Description length ${len} is a bit short; aim for 120–160.`))
   } else {
     out.push(result('description-length', GROUP_DESCRIPTION, 'ok', 2, 4, `Description length ${len} may be truncated in results (over 160).`))
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// CJK-aware measurement (round-5 item 22)
+//
+// The tokenizer in lang.ts is `[\p{L}\p{N}]+`, which is correct for
+// space-delimited scripts but collapses an entire unspaced Chinese/Japanese/
+// Korean clause into ONE token. A perfectly normal 800-character CJK article
+// therefore counted as a handful of "words" (false `content-word-count` bad)
+// while its single unsplit "sentence" sailed through the readability length
+// check. Both measurements are corrected here, in the layer that reports them:
+// the code-unit ranges are spelled out rather than using `\p{Script=…}` so the
+// QuickJS sandbox needs nothing beyond what lang.ts already relies on.
+//
+// English (and every other spaced script) is bit-for-bit unaffected: a token
+// with no CJK characters counts as exactly one word, and text with no CJK
+// terminator is not re-split.
+// ---------------------------------------------------------------------------
+
+function isCjkCodePoint(cp: number): boolean {
+  return (
+    (cp >= 0x3040 && cp <= 0x30ff) || // hiragana + katakana
+    (cp >= 0x3400 && cp <= 0x4dbf) || // CJK unified ext A
+    (cp >= 0x4e00 && cp <= 0x9fff) || // CJK unified
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xac00 && cp <= 0xd7a3) || // hangul syllables
+    (cp >= 0x1100 && cp <= 0x11ff) || // hangul jamo
+    (cp >= 0x3130 && cp <= 0x318f) || // hangul compatibility jamo
+    (cp >= 0x20000 && cp <= 0x2ffff) //  CJK unified ext B–F
+  )
+}
+
+/**
+ * Word count over tokens, counting an unspaced CJK run as ~1 word per 2
+ * characters (the ratio every mainstream CJK word counter approximates with)
+ * instead of as a single word. A token without CJK characters counts 1, so
+ * this equals `tokens.length` for spaced scripts.
+ */
+function wordUnits(tokens: string[]): number {
+  let total = 0
+  for (const token of tokens) {
+    let cjk = 0
+    let other = 0
+    for (const ch of token) {
+      if (isCjkCodePoint(ch.codePointAt(0) as number)) cjk += 1
+      else other += 1
+    }
+    total += cjk === 0 ? 1 : Math.ceil(cjk / 2) + (other > 0 ? 1 : 0)
+  }
+  return total
+}
+
+/** `wordUnits` over raw text. */
+function countTextUnits(text: string): number {
+  return wordUnits(tokenizeWords(text))
+}
+
+function isCjkTerminator(ch: string): boolean {
+  return ch === '。' || ch === '！' || ch === '？' || ch === '．'
+}
+
+function isCjkCloser(ch: string): boolean {
+  return /["'’”」』）】]/.test(ch)
+}
+
+/**
+ * Split further on the full-width terminators `。！？．`, which lang.ts's
+ * splitter does not know about (it only ends a sentence on ASCII `.!?…`,
+ * neither of which appears in ordinary CJK prose). Sentences with no such
+ * terminator are passed through unchanged.
+ */
+function splitCjkSentences(sentences: string[]): string[] {
+  const out: string[] = []
+  for (const sentence of sentences) {
+    let hasTerminator = false
+    for (const ch of sentence) {
+      if (isCjkTerminator(ch)) {
+        hasTerminator = true
+        break
+      }
+    }
+    if (!hasTerminator) {
+      out.push(sentence)
+      continue
+    }
+    let start = 0
+    let i = 0
+    while (i < sentence.length) {
+      if (!isCjkTerminator(sentence[i])) {
+        i += 1
+        continue
+      }
+      let j = i + 1
+      while (j < sentence.length && isCjkTerminator(sentence[j])) j += 1
+      while (j < sentence.length && isCjkCloser(sentence[j])) j += 1
+      const piece = sentence.slice(start, j).trim()
+      if (piece.length > 0) out.push(piece)
+      i = j
+      start = j
+    }
+    const rest = sentence.slice(start).trim()
+    if (rest.length > 0) out.push(rest)
   }
   return out
 }
@@ -344,7 +476,11 @@ function hostOf(url: string): string | null {
     if (m === null) return null
     rest = url.slice(m[0].length)
   }
-  const end = rest.search(/[/?#]/)
+  // `\` terminates the authority too: browsers normalise it to `/` in special
+  // (http/https) URLs, so `https://evil.example\@owner.example/x` navigates to
+  // evil.example. Without it the `\` stayed in the host, the userinfo strip
+  // yielded `owner.example`, and the link counted as INTERNAL.
+  const end = rest.search(/[/?#\\]/)
   let host = (end === -1 ? rest : rest.slice(0, end)).toLowerCase()
   const at = host.lastIndexOf('@')
   if (at !== -1) host = host.slice(at + 1)
@@ -382,7 +518,8 @@ export function classifyLinks(links: ParsedLink[], ownUrl: string | undefined): 
 
 export function runContentChecks(doc: DocContext): CheckResult[] {
   const out: CheckResult[] = []
-  const words = doc.textTokens.length
+  // CJK-aware: an unspaced run is not one word (see wordUnits).
+  const words = wordUnits(doc.textTokens)
 
   if (words >= 300) {
     out.push(result('content-word-count', GROUP_CONTENT, 'good', 6, 6, `${words} words — a solid amount of content.`))
@@ -437,7 +574,7 @@ export function runContentChecks(doc: DocContext): CheckResult[] {
     out.push(result('content-subheading-distribution', GROUP_CONTENT, 'na', 0, 3,
       doc.segmentTexts === null ? 'Headings unknown without HTML.' : 'Text is short enough to not need subheadings.'))
   } else {
-    const worst = Math.max(...doc.segmentTexts.map((t) => countWords(t)))
+    const worst = doc.segmentTexts.reduce((max, text) => Math.max(max, countTextUnits(text)), 0)
     out.push(
       worst <= 300
         ? result('content-subheading-distribution', GROUP_CONTENT, 'good', 3, 3, 'No stretch of text runs over 300 words without a subheading.')
@@ -454,13 +591,15 @@ export function runContentChecks(doc: DocContext): CheckResult[] {
 
 export function runReadabilityChecks(doc: DocContext): CheckResult[] {
   const out: CheckResult[] = []
-  const sentences = doc.sentences
+  // CJK-aware: `。！？` end a sentence too (see splitCjkSentences). Text
+  // without those characters comes back unchanged.
+  const sentences = splitCjkSentences(doc.sentences)
   const sentenceTokens = sentences.map((s) => tokenizeWords(s))
 
   if (sentences.length === 0) {
     out.push(result('readability-sentence-length', GROUP_READABILITY, 'na', 0, 4, 'No sentences to measure.'))
   } else {
-    const totalWords = sentenceTokens.reduce((n, t) => n + t.length, 0)
+    const totalWords = sentenceTokens.reduce((n, t) => n + wordUnits(t), 0)
     const avg = totalWords / sentences.length
     const avgText = `${Math.round(avg * 10) / 10}`
     if (avg <= 20) {
@@ -475,7 +614,7 @@ export function runReadabilityChecks(doc: DocContext): CheckResult[] {
   if (doc.paragraphs.length === 0) {
     out.push(result('readability-paragraph-length', GROUP_READABILITY, 'na', 0, 3, 'No paragraphs to measure.'))
   } else {
-    const worst = Math.max(...doc.paragraphs.map((p) => countWords(p)))
+    const worst = doc.paragraphs.reduce((max, paragraph) => Math.max(max, countTextUnits(paragraph)), 0)
     if (worst <= 150) {
       out.push(result('readability-paragraph-length', GROUP_READABILITY, 'good', 3, 3, 'No paragraph exceeds 150 words.'))
     } else if (worst <= 200) {

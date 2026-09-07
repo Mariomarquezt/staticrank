@@ -31,7 +31,7 @@ SDKPATCH
 
 # 2. Unit tests import 'bun:test', which the CLI's sandbox scan forbids in
 #    the plugin tree — and they do not belong in a shipped zip either.
-find "$WORK" -type d -name '__tests__' -prune -exec rm -rf {} + 2>/dev/null || true
+find "$WORK" -type d -name '__tests__' -prune -exec rm -rf {} +
 
 # 3. UPSTREAM GAP: the pinned `definePlugin` builder silently DROPS the
 #    manifest's `contentAccess` key, and the manifest validator then

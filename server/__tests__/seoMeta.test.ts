@@ -3,7 +3,12 @@ import {
   CUSTOM_SCHEMA_JSON_MAX,
   DESCRIPTION_MAX,
   ENTRY_ID_RE,
+  ENTRY_REF_COMPONENT_MAX,
+  FOCUS_KEYWORD_MAX,
+  FOCUS_KEYWORDS_MAX,
+  MAX_FOCUS_KEYWORDS_JSON_LENGTH,
   SEO_META_FIELD_IDS,
+  SEO_META_REQUEST_BODY_MAX,
   TABLE_SLUG_RE,
   TITLE_MAX,
   URL_MAX,
@@ -13,8 +18,10 @@ import {
   parseEntryRef,
   parseJsonBody,
   parseQueryParams,
+  parseStoredFocusKeywords,
   seoMetaKey,
   serializeSeoMeta,
+  isSeoMetaRequestBodyWithinLimit,
   validateSeoMeta,
   type SeoMetaPayload,
 } from '../seoMeta'
@@ -23,6 +30,31 @@ function errorFields(input: unknown): string[] {
   const result = validateSeoMeta(input)
   if (result.ok) throw new Error('expected validation to fail')
   return result.errors.map((e) => e.field)
+}
+
+function maxCustomSchemaJson(): string {
+  const prefix = '{"@type":"Thing","pad":"'
+  const suffix = '"}'
+  return `${prefix}${'x'.repeat(CUSTOM_SCHEMA_JSON_MAX - prefix.length - suffix.length)}${suffix}`
+}
+
+function maxSeoMetaPayload(): SeoMetaPayload {
+  return {
+    title: 'x'.repeat(TITLE_MAX),
+    metaDescription: 'x'.repeat(DESCRIPTION_MAX),
+    canonical: `/${'x'.repeat(URL_MAX - 1)}`,
+    robots: { noindex: true, nofollow: false },
+    ogTitle: 'x'.repeat(TITLE_MAX),
+    ogDescription: 'x'.repeat(DESCRIPTION_MAX),
+    ogImage: `/${'x'.repeat(URL_MAX - 1)}`,
+    twitterCard: 'summary_large_image',
+    focusKeywords: Array.from(
+      { length: FOCUS_KEYWORDS_MAX },
+      (_, index) => `${index}${'x'.repeat(FOCUS_KEYWORD_MAX - String(index).length)}`,
+    ),
+    schemaType: 'SearchResultsPage',
+    customSchemaJson: maxCustomSchemaJson(),
+  }
 }
 
 describe('validateSeoMeta', () => {
@@ -170,11 +202,63 @@ describe('validateSeoMeta', () => {
     expect(validateSeoMeta(new Payload()).ok).toBe(false)
   })
 
+  // Round 5 triage C#5: the host trims every text field on write
+  // (resourceRecords.ts:61), so an untrimmed validated value diverges from
+  // storage and a whitespace-only one stores as '' — the field vanishes
+  // out of a save that reported success. Parity with seoConfig's
+  // checkTrimmedString.
+  test('title/description fields are stored TRIMMED, matching what the host writes', () => {
+    const result = validateSeoMeta({
+      title: '  Padded title  ',
+      metaDescription: '\tPadded description\n',
+      ogTitle: ' Padded OG title ',
+      ogDescription: ' Padded OG description ',
+    })
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.value).toEqual({
+        title: 'Padded title',
+        metaDescription: 'Padded description',
+        ogTitle: 'Padded OG title',
+        ogDescription: 'Padded OG description',
+      })
+    }
+  })
+
+  test('whitespace-only title/description fields are rejected, not silently dropped', () => {
+    for (const field of ['title', 'metaDescription', 'ogTitle', 'ogDescription']) {
+      expect(errorFields({ [field]: '   ' })).toEqual([field])
+      expect(errorFields({ [field]: '\t\n' })).toEqual([field])
+    }
+  })
+
+  test("'' still means clear-by-empty (serializeSeoMeta drops it)", () => {
+    const result = validateSeoMeta({ title: '', metaDescription: '' })
+    expect(result.ok).toBe(true)
+    const data = serializeSeoMeta('pages:p1', { title: '', metaDescription: '' })
+    expect(Object.keys(data)).toEqual(['key'])
+  })
+
   test('accepts null-prototype payloads and reads own properties only', () => {
     const nullProto = Object.assign(Object.create(null), { title: 'ok' })
     const result = validateSeoMeta(nullProto)
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.value).toEqual({ title: 'ok' })
+  })
+})
+
+describe('POST /meta request-body contract', () => {
+  test('accepts a payload at every validator field cap and rejects an oversize body', () => {
+    const payload = maxSeoMetaPayload()
+    const validated = validateSeoMeta(payload)
+    expect(validated.ok).toBe(true)
+
+    const raw = JSON.stringify(payload)
+    expect(raw.length).toBeLessThanOrEqual(SEO_META_REQUEST_BODY_MAX)
+    expect(isSeoMetaRequestBodyWithinLimit(raw)).toBe(true)
+
+    const oversize = `${raw}${' '.repeat(SEO_META_REQUEST_BODY_MAX - raw.length + 1)}`
+    expect(isSeoMetaRequestBodyWithinLimit(oversize)).toBe(false)
   })
 })
 
@@ -217,6 +301,17 @@ describe('serialize / deserialize', () => {
       robotsNoindex: 'yes',
       twitterCard: 'player',
       ogImage: '',
+    })
+    expect(meta).toEqual({})
+  })
+
+  test('read validation rejects forged URL and over-length fields', () => {
+    const meta = deserializeSeoMeta({
+      key: 'pages:forged',
+      canonical: 'javascript:alert(1)',
+      ogImage: '//evil.example/image.png',
+      title: 'x'.repeat(TITLE_MAX + 1),
+      metaDescription: 'x'.repeat(DESCRIPTION_MAX + 1),
     })
     expect(meta).toEqual({})
   })
@@ -283,6 +378,33 @@ describe('parseEntryRef', () => {
     const byEntry = parseEntryRef('/meta?table=a&entry=b%3Ac')
     expect(byEntry.ok).toBe(false)
     if (!byEntry.ok) expect(byEntry.errors.map((e) => e.field)).toEqual(['entry'])
+  })
+
+  // Round 5 triage C#5: length parity with seoConfig's TABLE_SLUG_MAX —
+  // an over-long component is named as such instead of being charset-
+  // scanned in full and reported as a charset problem.
+  test('caps each component length, naming the field', () => {
+    const atCap = 'a'.repeat(ENTRY_REF_COMPONENT_MAX)
+    const overCap = 'a'.repeat(ENTRY_REF_COMPONENT_MAX + 1)
+    expect(parseEntryRef(`/meta?table=${atCap}&entry=${atCap}`)).toEqual({
+      ok: true,
+      tableSlug: atCap,
+      entryId: atCap,
+    })
+    const overTable = parseEntryRef(`/meta?table=${overCap}&entry=e1`)
+    expect(overTable.ok).toBe(false)
+    if (!overTable.ok) {
+      expect(overTable.errors).toEqual([
+        { field: 'table', message: `must be at most ${ENTRY_REF_COMPONENT_MAX} characters` },
+      ])
+    }
+    const overEntry = parseEntryRef(`/meta?table=pages&entry=${overCap}`)
+    expect(overEntry.ok).toBe(false)
+    if (!overEntry.ok) {
+      expect(overEntry.errors).toEqual([
+        { field: 'entry', message: `must be at most ${ENTRY_REF_COMPONENT_MAX} characters` },
+      ])
+    }
   })
 
   test('component charsets match host formats', () => {
@@ -440,6 +562,33 @@ describe('serialize/deserialize — focusKeywords (JSON-string flat field) + sch
     expect(isEmptySeoMeta({ focusKeywords: ['a'] })).toBe(false)
     expect(isEmptySeoMeta({ schemaType: 'WebPage' })).toBe(false)
   })
+
+  // Round 5 triage C#4: the RAW string is gated before JSON.parse, so a
+  // hand-edited multi-megabyte record cannot burn the publish deadline
+  // before the per-item caps get a chance to apply.
+  test('a stored keywords string over the JSON cap is refused BEFORE parsing', () => {
+    const oversize = JSON.stringify(Array.from({ length: 900 }, (_, i) => `keyword-${i}`))
+    expect(oversize.length).toBeGreaterThan(MAX_FOCUS_KEYWORDS_JSON_LENGTH)
+    // It parses perfectly well and would otherwise yield the first 10.
+    expect(JSON.parse(oversize)[0]).toBe('keyword-0')
+    expect(parseStoredFocusKeywords(oversize)).toBeUndefined()
+    expect(deserializeSeoMeta({ key: 'k', focusKeywords: oversize })).toEqual({})
+  })
+
+  test('the cap admits every value serializeSeoMeta can actually write', () => {
+    const maxed = Array.from(
+      { length: FOCUS_KEYWORDS_MAX },
+      // Worst case for the escaped-length budget: a control character
+      // costs six JSON characters and survives `trim()`; the leading
+      // digit keeps the ten items distinct under the dedupe rule.
+      (_, i) => `${i}${'\u0001'.repeat(FOCUS_KEYWORD_MAX - String(i).length)}`,
+    )
+    const data = serializeSeoMeta('pages:p1', { focusKeywords: maxed })
+    expect((data.focusKeywords as string).length).toBeLessThanOrEqual(
+      MAX_FOCUS_KEYWORDS_JSON_LENGTH,
+    )
+    expect(parseStoredFocusKeywords(data.focusKeywords)).toEqual(maxed)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -448,6 +597,12 @@ describe('serialize/deserialize — focusKeywords (JSON-string flat field) + sch
 
 describe('customSchemaJson', () => {
   const validJson = '{"@context":"https://schema.org","@type":"Offer","price":"1"}'
+
+  const nestedJson = (depth: number): string =>
+    '{"@type":"Thing","nested":' +
+    '{"nested":'.repeat(depth - 1) +
+    '0' +
+    '}'.repeat(depth)
 
   test('accepts a valid JSON-LD object string', () => {
     const result = validateSeoMeta({ customSchemaJson: validJson })
@@ -468,7 +623,21 @@ describe('customSchemaJson', () => {
     expect(errorFields({ customSchemaJson: '"scalar"' })).toEqual(['customSchemaJson'])
     expect(errorFields({ customSchemaJson: '{"name":"no type"}' })).toEqual(['customSchemaJson'])
     expect(errorFields({ customSchemaJson: '{"@type":""}' })).toEqual(['customSchemaJson'])
+    expect(errorFields({ customSchemaJson: '{"@type":"   "}' })).toEqual(['customSchemaJson'])
     expect(errorFields({ customSchemaJson: '{"@type":42}' })).toEqual(['customSchemaJson'])
+  })
+
+  test('rejects customSchemaJson deeper than the template rawJson limit on write', () => {
+    expect(validateSeoMeta({ customSchemaJson: nestedJson(32) }).ok).toBe(true)
+    const result = validateSeoMeta({ customSchemaJson: nestedJson(33) })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.errors[0]?.field).toBe('customSchemaJson')
+      expect(result.errors[0]?.message).toContain('32')
+    }
+    // The guard itself must stay iterative: this is the QuickJS-risk shape
+    // from the report, not a recursive test helper or traversal.
+    expect(validateSeoMeta({ customSchemaJson: nestedJson(3000) }).ok).toBe(false)
   })
 
   test('enforces the CUSTOM_SCHEMA_JSON_MAX length cap', () => {
@@ -504,6 +673,9 @@ describe('customSchemaJson', () => {
     expect(deserializeSeoMeta({ key: 'k', customSchemaJson: '[1]' })).toEqual({})
     expect(deserializeSeoMeta({ key: 'k', customSchemaJson: '{"no":"type"}' })).toEqual({})
     expect(deserializeSeoMeta({ key: 'k', customSchemaJson: 42 })).toEqual({})
+    expect(deserializeSeoMeta({ key: 'k', customSchemaJson: '{"@type":" "}' })).toEqual({})
+    expect(deserializeSeoMeta({ key: 'k', customSchemaJson: nestedJson(33) })).toEqual({})
+    expect(deserializeSeoMeta({ key: 'k', customSchemaJson: nestedJson(3000) })).toEqual({})
     const oversized = `{"@type":"Thing","pad":"${'x'.repeat(CUSTOM_SCHEMA_JSON_MAX)}"}`
     expect(deserializeSeoMeta({ key: 'k', customSchemaJson: oversized })).toEqual({})
   })

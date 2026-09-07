@@ -8,6 +8,8 @@ import {
   isConfigFormDirty,
   mergeDirtyConfig,
   nextRowId,
+  parseDecorationFailures,
+  parseIndexNowFailure,
   planConfigSave,
   previewTemplate,
   sampleTemplateVars,
@@ -43,7 +45,11 @@ describe('formFromConfig / configFromForm round-trip', () => {
   }
 
   test('round-trips a full document', () => {
-    expect(configFromForm(formFromConfig(config))).toEqual(config)
+    expect(configFromForm(formFromConfig(config))).toEqual({
+      ...config,
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+    })
   })
 
   test('rows come out sorted by slug with deterministic ids 0..n-1', () => {
@@ -53,7 +59,10 @@ describe('formFromConfig / configFromForm round-trip', () => {
   })
 
   test('empty form → empty document', () => {
-    expect(configFromForm(emptyConfigForm())).toEqual({})
+    expect(configFromForm(emptyConfigForm())).toEqual({
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+    })
   })
 
   test('whitespace-only values are absent; half-filled rows contribute nothing', () => {
@@ -61,14 +70,21 @@ describe('formFromConfig / configFromForm round-trip', () => {
       siteName: '   ',
       tableRows: [row('posts', '   '), row('', '%title%')],
     })
-    expect(configFromForm(state)).toEqual({})
+    expect(configFromForm(state)).toEqual({
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+    })
   })
 
   test('duplicate slugs: first row wins in the document', () => {
     const state = form({
       tableRows: [row('posts', 'A'), row('posts', 'B')],
     })
-    expect(configFromForm(state)).toEqual({ tables: { posts: { titleTemplate: 'A' } } })
+    expect(configFromForm(state)).toEqual({
+      tables: { posts: { titleTemplate: 'A' } },
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+    })
   })
 })
 
@@ -94,6 +110,8 @@ describe('validateConfigForm', () => {
     )
     expect(result.ok).toBe(true)
     expect(result.config).toEqual({
+      indexNow: { enabled: true },
+      schema: { enabled: true },
       site: {
         siteName: 'Acme',
         siteUrl: 'https://acme.test',
@@ -257,14 +275,14 @@ describe('mergeDirtyConfig (lost-update fix)', () => {
       indexNow: { enabled: false },
     })
 
-    // Re-enable: baseline disabled, user switched on → section drops
-    // entirely (enabled is the absent default).
+    // Re-enable: versioned storage needs an explicit true.
     const disabledStored: SeoConfigData = { ...storedAtLoad, indexNow: { enabled: false } }
     const disabledBaseline = formFromConfig(disabledStored)
     const onForm = { ...disabledBaseline, indexNowEnabled: true }
     expect(mergeDirtyConfig(disabledStored, onForm, disabledBaseline)).toEqual({
       site: { siteName: 'Old', siteUrl: 'https://acme.test' },
       tables: { posts: { titleTemplate: 'T1' } },
+      indexNow: { enabled: true },
     })
   })
 
@@ -272,8 +290,14 @@ describe('mergeDirtyConfig (lost-update fix)', () => {
     expect(formFromConfig({ indexNow: { enabled: false } }).indexNowEnabled).toBe(false)
     expect(formFromConfig({}).indexNowEnabled).toBe(true)
     const offForm = { ...formFromConfig({}), indexNowEnabled: false }
-    expect(configFromForm(offForm)).toEqual({ indexNow: { enabled: false } })
-    expect(configFromForm(formFromConfig({}))).toEqual({})
+    expect(configFromForm(offForm)).toEqual({
+      indexNow: { enabled: false },
+      schema: { enabled: true },
+    })
+    expect(configFromForm(formFromConfig({}))).toEqual({
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+    })
   })
 
   test('undirty site fields keep the FRESH value, not the baseline one', () => {
@@ -440,5 +464,59 @@ describe('template preview', () => {
     // (templateEngine's hadEmptyVariable); the sample vars always supply
     // placeholders, so a trailing %sep% stays visible in the preview.
     expect(previewTemplate('%title% %sep%', form({ separator: '|' }))).toBe('Sample Page |')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Decoration-failure warning (review 2026-08-15)
+// ---------------------------------------------------------------------------
+
+describe('parseDecorationFailures', () => {
+  test('reads a real warning', () => {
+    expect(
+      parseDecorationFailures({
+        siteName: 'x',
+        decorationFailures: { count: 3, lastAt: '2026-08-15T12:00:00.000Z', pages: ['p1', 'p2'] },
+      }),
+    ).toEqual({ count: 3, lastAt: '2026-08-15T12:00:00.000Z', pages: ['p1', 'p2'] })
+  })
+
+  test('a zero or missing count is NOT a warning', () => {
+    expect(parseDecorationFailures({ decorationFailures: { count: 0, pages: [] } })).toBeUndefined()
+    expect(parseDecorationFailures({ siteName: 'x' })).toBeUndefined()
+    expect(parseDecorationFailures(null)).toBeUndefined()
+  })
+
+  test('a malformed warning degrades instead of breaking the settings load', () => {
+    expect(parseDecorationFailures({ decorationFailures: 'broken' })).toBeUndefined()
+    expect(
+      parseDecorationFailures({ decorationFailures: { count: 2, pages: 'nope', lastAt: 5 } }),
+    ).toEqual({ count: 2, pages: [] })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// IndexNow failure warning
+// ---------------------------------------------------------------------------
+
+describe('parseIndexNowFailure', () => {
+  test('reads a recorded failure', () => {
+    expect(
+      parseIndexNowFailure({
+        indexNowFailure: {
+          status: 'error: invalid IndexNow key',
+          lastAt: '2026-08-16T12:00:00.000Z',
+        },
+      }),
+    ).toEqual({
+      status: 'error: invalid IndexNow key',
+      lastAt: '2026-08-16T12:00:00.000Z',
+    })
+  })
+
+  test('ignores missing or malformed warnings', () => {
+    expect(parseIndexNowFailure({})).toBeUndefined()
+    expect(parseIndexNowFailure({ indexNowFailure: { status: '' } })).toBeUndefined()
+    expect(parseIndexNowFailure({ indexNowFailure: 'broken' })).toBeUndefined()
   })
 })

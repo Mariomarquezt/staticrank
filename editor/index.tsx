@@ -19,11 +19,11 @@
  *       + the 'instatic:locationchange' event the <Router> subscribes to
  *       (Router.tsx:96-120, routerHooks.ts:59). No hard reload.
  *       "SEO: open panel" — site workspace only (workspaces gate): flips
- *       the rail to this plugin's panel via the editor store's own
- *       `setActivePluginPanel` action (uiSlice.ts:480-487), reached
- *       through `api.editor.store.read()` (the zustand state carries the
- *       action functions; `editor.store.read` is already granted for the
- *       panel itself).
+ *       the rail to this plugin's panel through
+ *       `api.editor.store.transaction` (permission `editor.store.write`,
+ *       runtime.ts:495-504), applying the same two state changes the
+ *       host's own PanelRail does (PanelRail.tsx:140-143). This is the
+ *       plugin's ONLY editor-state write.
  *
  * SDK note: `definePluginPanel` is an identity wrapper with build-time id
  * validation; importing it AT RUNTIME would inline the whole SDK barrel
@@ -111,25 +111,45 @@ const mod = {
       workspaces: ['site'],
       run: () => {
         try {
-          // The editor store state carries its action functions;
-          // setActivePluginPanel is the same action the panel rail invokes,
-          // and PanelRail's revealPluginPanel ALSO collapses the properties
-          // sidebar first (vendor PanelRail.tsx:145-148) — replicated here
-          // when the action is reachable (review C nit). store.read()
-          // asserts `editor.store.read`.
-          const store = api.editor.store.read() as unknown as {
-            setActivePluginPanel?: (panelId: string | null) => void
-            setPropertiesPanel?: (patch: { collapsed: boolean }) => void
-          }
-          if (typeof store.setActivePluginPanel === 'function') {
-            if (typeof store.setPropertiesPanel === 'function') {
-              store.setPropertiesPanel({ collapsed: true })
+          // Round-5 t1-00 (consent honesty): revealing the panel MUTATES
+          // editor state, so it goes through `store.transaction` — the
+          // host's sanctioned write path, which asserts `editor.store.write`
+          // (runtime.ts:495-504); the manifest declares that permission.
+          // The previous version called the live setter functions handed
+          // out by `store.read()`, i.e. it wrote editor state under a
+          // read-only grant.
+          //
+          // The DRAFT fields are assigned rather than the store's own
+          // actions: `transaction` runs its callback inside a mutative
+          // recipe, so an action's nested `set()` would be discarded when
+          // the outer recipe finalizes from this draft.
+          let applied = false
+          api.editor.store.transaction((state) => {
+            const draft = state as unknown as {
+              activePluginPanelId?: string | null
+              explorerPanelOpen?: boolean
+              selectorsPanelOpen?: boolean
+              frameworkPanelOpen?: boolean
+              dependenciesPanelOpen?: boolean
+              propertiesPanel?: { collapsed: boolean }
             }
-            store.setActivePluginPanel(PANEL_ID)
-            return
-          }
+            // Only the site-editor store carries the rail state.
+            if (!('activePluginPanelId' in draft)) return
+            // Mirror of PanelRail's revealPluginPanel (PanelRail.tsx:140-143)
+            // = setPropertiesPanel({collapsed:true}) + setActivePluginPanel,
+            // whose slice bodies are uiSlice.ts:335-350 and :480-487.
+            if (draft.propertiesPanel !== undefined) draft.propertiesPanel.collapsed = true
+            draft.explorerPanelOpen = false
+            draft.selectorsPanelOpen = false
+            draft.frameworkPanelOpen = false
+            draft.dependenciesPanelOpen = false
+            draft.activePluginPanelId = PANEL_ID
+            applied = true
+          })
+          if (applied) return
           return { message: 'SEO panel is unavailable in this view.' }
         } catch {
+          // requireEditorStore() throws outside an editor route.
           return { message: 'Open a site in the editor first.' }
         }
       },

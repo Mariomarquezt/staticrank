@@ -20,6 +20,15 @@ describe('pageUrl', () => {
     expect(pageUrl(ORIGIN, 'a b/c&d')).toBe('https://example.com/a%20b/c%26d')
   })
 
+  test('replaces lone surrogates without corrupting valid Unicode pairs', () => {
+    expect(pageUrl(ORIGIN, 'bad\uD800/😀')).toBe(
+      'https://example.com/bad%EF%BF%BD/%F0%9F%98%80',
+    )
+    expect(slugBreadcrumbs(ORIGIN, 'bad\uD800/leaf')[1]?.url).toBe(
+      'https://example.com/bad%EF%BF%BD',
+    )
+  })
+
   test('sitemap re-export IS this helper (shared-URL unification)', () => {
     // One mapping for both consumers: identity, not just equal output.
     expect(sitemapPageUrl).toBe(pageUrl)

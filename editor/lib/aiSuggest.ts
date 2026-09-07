@@ -52,7 +52,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** GET /ai/status view — never carries the key (contract hard rule). */
 export interface AiStatusView {
   configured: boolean
-  /** Provider id ('anthropic' | 'openai' | 'openrouter') or null when unset. */
+  /** Provider id when configured, or null when unset. */
   provider: string | null
   /** Effective model id; '' when the server reports none. */
   model: string

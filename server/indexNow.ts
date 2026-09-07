@@ -23,8 +23,8 @@
  * QUALITY CAVEAT: Math.random is not a CSPRNG. Acceptable here: the key
  * only authorizes URL submissions for THIS host — a guessed key lets an
  * attacker send spurious "this URL changed" pings for our own site,
- * nothing more. Operators can rotate by clearing the key via the config
- * API (a new one is generated on the next submission).
+ * nothing more. Operators can rotate via the authenticated DELETE
+ * `indexnow-key.txt` route (a new one is generated on the next submission).
  *
  * Delivery discipline (review fix #8): the publish path NEVER performs
  * network I/O — `publish.after` only marks changed records `pending`

@@ -47,6 +47,15 @@ export default definePlugin({
     // activePageId / site.pages) via `useEditorStore`, which asserts
     // `editor.store.read` per call (plugin-host-hooks/index.ts:69-77).
     permissions.editorStoreRead,
+    // Round-5 t1-00: the ⌘K "SEO: open panel" command OPENS this plugin's
+    // rail panel, which is a write to editor state — the same two writes
+    // the host's own PanelRail performs (PanelRail.tsx:140-143). The host
+    // offers no read-safe way to reveal a panel, so the write goes through
+    // `api.editor.store.transaction` (runtime.ts:495-504) and the grant is
+    // declared HONESTLY here: install consent used to say "inspect editor
+    // state" while the command mutated it. Nothing else in this plugin
+    // writes editor state.
+    permissions.editorStoreWrite,
     // Task 2.2: anonymous-callable runtime routes for sitemap.xml,
     // llms.txt, and the IndexNow key file (`api.cms.routes.public.*`
     // dispatches with user: null — vendor server/plugins/runtime.ts:
@@ -102,8 +111,8 @@ export default definePlugin({
   // Exactly the IndexNow API endpoint; sitemap "submission" IS the
   // IndexNow POST (the deprecated sitemap-ping endpoints are gone).
   // Task 3.2: the license host is PRO-ONLY — the free build strips every
-  // entry except api.indexnow.org (scripts/build.ts --tier free). Keep the
-  // license host in sync with LICENSE_API_ORIGIN (server/license/types.ts).
+  // entry except api.indexnow.org (scripts/build.ts --tier free). Pro-only
+  // hosts stay private to this manifest; the free build strips them.
   // Task 3.7: GSC hosts are PRO-only (free strips to api.indexnow.org).
   networkAllowedHosts: [
     // The free build makes exactly one outbound call: IndexNow
@@ -168,6 +177,7 @@ export default definePlugin({
       pluralLabel: 'SEO config records',
       fields: [
         { id: 'key', label: 'Key (site | table:<tableSlug>)', type: 'text', required: true },
+        { id: 'version', label: 'Config shape version', type: 'number' },
         { id: 'siteName', label: 'Site name (%site%)', type: 'text' },
         { id: 'separator', label: 'Title separator (%sep%)', type: 'text' },
         { id: 'siteUrl', label: 'Site URL (canonical base)', type: 'text' },
@@ -214,7 +224,7 @@ export default definePlugin({
       singularLabel: 'SEO state record',
       pluralLabel: 'SEO state records',
       fields: [
-        { id: 'key', label: 'Key (indexnow | reconcile | ai)', type: 'text', required: true },
+        { id: 'key', label: 'Key (indexnow | reconcile | ai | ai-bulk-scan)', type: 'text', required: true },
         { id: 'indexNowKey', label: 'IndexNow key', type: 'text' },
         { id: 'lastSubmittedAt', label: 'Last IndexNow submission', type: 'text' },
         { id: 'lastStatus', label: 'Last IndexNow status', type: 'text' },
@@ -224,6 +234,13 @@ export default definePlugin({
         // cannot render a searchable 400-entry list). Overrides the host
         // `aiModel` setting. NOT a secret — a model id, never a key.
         { id: 'aiModel', label: 'AI model id (chosen in the SEO AI tab)', type: 'text' },
+        // Review 2026-08-15 — `decoration` record: a publish whose SEO
+        // decoration threw ships the page WITHOUT meta/JSON-LD/analytics.
+        // The filter is read-only, so publish.after persists the tally
+        // here and the admin can stop guessing why tags vanished.
+        { id: 'lastFailureAt', label: 'Last publish that shipped without SEO tags', type: 'text' },
+        { id: 'failureCount', label: 'Publishes that shipped without SEO tags', type: 'number' },
+        { id: 'failurePages', label: 'Recent failed page ids (JSON array)', type: 'longtext' },
       ],
     },
     // Published-page index (task 2.2): one record per published page,

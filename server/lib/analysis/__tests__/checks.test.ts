@@ -207,6 +207,11 @@ describe('description checks', () => {
 })
 
 describe('content checks', () => {
+  test('large paragraph and subheading lists do not overflow Math.max spread', () => {
+    const html = `${'<h2>Section</h2><p>x</p>'.repeat(10_000)}`
+    expect(() => run({ html })).not.toThrow()
+  })
+
   test('word count thresholds (300 good / 150 ok / under 150 bad)', () => {
     expect(run({ text: lorem(320) })('content-word-count').status).toBe('good')
     expect(run({ text: lorem(200) })('content-word-count').status).toBe('ok')
@@ -325,5 +330,89 @@ describe('readability checks', () => {
     expect(c('readability-paragraph-length').status).toBe('na')
     expect(c('readability-passive-voice').status).toBe('na')
     expect(c('readability-transition-words').status).toBe('na')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Round-5 triage fixes
+// ---------------------------------------------------------------------------
+
+describe('round-5 item 21: existence and length measure the SAME value', () => {
+  test('leading/trailing whitespace no longer inflates the title length', () => {
+    // 11 visible characters padded to 31: used to score the 30–60 sweet spot.
+    const padded = `${' '.repeat(20)}Hello World`
+    const c = run({ title: padded, text: 'x' })
+    expect(c('title-exists').status).toBe('good')
+    expect(c('title-length').status).toBe('ok')
+    expect(c('title-length').detail).toContain('11')
+  })
+
+  test('internal whitespace runs are collapsed before measuring', () => {
+    const c = run({ title: `Hello${' '.repeat(40)}World`, text: 'x' })
+    expect(c('title-length').detail).toContain('11')
+  })
+
+  test('a zero-width-only title does not exist', () => {
+    const c = run({ title: '​​﻿', text: 'x' })
+    expect(c('title-exists').status).toBe('bad')
+    expect(c('title-length').status).toBe('na')
+  })
+
+  test('zero-width padding does not inflate the description length', () => {
+    const desc = 'x'.repeat(50) + '​'.repeat(100)
+    const c = run({ metaDescription: desc, text: 'x' })
+    expect(c('description-length').status).toBe('bad') // 50 visible, not 150
+    expect(c('description-length').detail).toContain('50')
+  })
+
+  test('ordinary values are measured exactly as before', () => {
+    expect(run({ title: 'x'.repeat(45), text: 'x' })('title-length').status).toBe('good')
+    expect(run({ metaDescription: 'x'.repeat(140), text: 'x' })('description-length').status).toBe('good')
+  })
+})
+
+describe('round-5 item 22: CJK segmentation', () => {
+  // ~720 Han characters with no spaces: ONE token to a [\p{L}\p{N}]+ scanner.
+  const cjkRun = '内容营销策略指南每日更新'.repeat(60)
+
+  test('an unspaced CJK run is not one word', () => {
+    const c = run({ text: cjkRun })
+    expect(c('content-word-count').status).toBe('good')
+    expect(c('content-word-count').detail).not.toContain('1 words')
+  })
+
+  test('a short CJK text is still reported as thin', () => {
+    const c = run({ text: '内容营销' })
+    expect(c('content-word-count').status).toBe('bad')
+  })
+
+  test('。 terminates a sentence, so length is measured per sentence', () => {
+    // One 400-character "sentence" to lang.ts; 34 real sentences here.
+    const prose = '内容营销策略指南每日更新。'.repeat(34)
+    const c = run({ text: prose })
+    expect(c('readability-sentence-length').status).toBe('good')
+    // Without the split this is a single ~200-word sentence → 'bad'.
+    const unsplit = run({ text: '内容营销策略指南每日更新'.repeat(34) })
+    expect(unsplit('readability-sentence-length').status).toBe('bad')
+  })
+
+  test('English measurement is untouched', () => {
+    expect(run({ text: lorem(400) })('content-word-count').detail).toContain('400 words')
+    expect(run({ text: lorem(200) })('content-word-count').status).toBe('ok')
+    expect(run({ text: lorem(100) })('content-word-count').status).toBe('bad')
+  })
+})
+
+describe('round-5 item 23: backslash terminates the URL authority', () => {
+  test('`\\` in the authority is not part of the host (browsers treat it as /)', () => {
+    const html = '<p><a href="https://evil.example\\@owner.example/x">x</a></p>'
+    const c = run({ html, url: 'https://owner.example/post' })
+    expect(c('content-external-link').status).toBe('good')
+    expect(c('content-internal-link').status).toBe('bad')
+  })
+
+  test('a genuine same-host link still counts as internal', () => {
+    const c = run({ html: '<p><a href="https://owner.example/x">x</a></p>', url: 'https://owner.example/post' })
+    expect(c('content-internal-link').status).toBe('good')
   })
 })

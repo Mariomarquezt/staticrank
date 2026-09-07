@@ -30,7 +30,8 @@
  * single- OR double-quoted attributes, and MULTIPLE CSP metas. Multiple
  * policies COMBINE (a script must satisfy every policy), so:
  *
- *   - every CSP meta whose policy HAS a `script-src` gets the hashes
+ *   - every CSP meta whose policy HAS a `script-src` or `script-src-elem`
+ *     gets the hashes
  *     (its lone `'none'` is REPLACED by them, never emitted alongside);
  *   - a policy whose `script-src` already carries `'unsafe-inline'` is
  *     left untouched (per CSP2+ a hash's presence makes browsers IGNORE
@@ -66,6 +67,8 @@ interface AttrSpan {
   /** [valueStart, valueEnd) span of the value inside the document. */
   valueStart: number
   valueEnd: number
+  /** The original delimiter, or null when the value was unquoted. */
+  quote: '"' | "'" | null
 }
 
 /** Find a tag's closing `>` respecting both quote types (cf. imageAudit). */
@@ -81,7 +84,10 @@ function findTagEnd(html: string, start: number): number {
       return i + 1
     }
   }
-  return html.length
+  // An unterminated quote makes the rest of the document look like one tag.
+  // Return a recovery sentinel so the caller can resume scanning at the next
+  // `<meta` instead of hiding later CSP policies.
+  return -1
 }
 
 function isSpace(code: number): boolean {
@@ -106,13 +112,15 @@ function parseAttrSpans(html: string, start: number, end: number): AttrSpan[] {
     let value = ''
     let valueStart = i
     let valueEnd = i
+    let quote: AttrSpan['quote'] = null
     if (i < end && html.charCodeAt(i) === 61) {
       i++
       while (i < end && isSpace(html.charCodeAt(i))) i++
       if (i < end && (html.charCodeAt(i) === 34 || html.charCodeAt(i) === 39)) {
-        const quote = html.charCodeAt(i++)
+        const quoteCode = html.charCodeAt(i++)
+        quote = quoteCode === 34 ? '"' : "'"
         valueStart = i
-        while (i < end && html.charCodeAt(i) !== quote) i++
+        while (i < end && html.charCodeAt(i) !== quoteCode) i++
         valueEnd = i
         value = html.slice(valueStart, valueEnd)
         if (i < end) i++
@@ -123,7 +131,7 @@ function parseAttrSpans(html: string, start: number, end: number): AttrSpan[] {
         value = html.slice(valueStart, valueEnd)
       }
     }
-    if (name !== '/') attrs.push({ name, value, valueStart, valueEnd })
+    if (name !== '/') attrs.push({ name, value, valueStart, valueEnd, quote })
   }
   return attrs
 }
@@ -134,6 +142,33 @@ export interface CspMetaMatch {
   /** [start, end) span of the policy inside the document, for splicing. */
   valueStart: number
   valueEnd: number
+  /** The original `content` attribute delimiter, or null if unquoted. */
+  quote: AttrSpan['quote']
+}
+
+function decodeHtmlAttributeValue(value: string): string {
+  return value.replace(
+    /&(?:amp|quot|apos|#39|#x27|lt|gt);/gi,
+    (entity) =>
+      ({
+        '&amp;': '&',
+        '&quot;': '"',
+        '&apos;': "'",
+        '&#39;': "'",
+        '&#x27;': "'",
+        '&lt;': '<',
+        '&gt;': '>',
+      })[entity.toLowerCase()] ?? entity,
+  )
+}
+
+/** Serialize a policy without allowing its CSP source quotes to close HTML. */
+function serializeCspAttributeValue(value: string, quote: AttrSpan['quote']): string {
+  let escaped = value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+  if (quote === "'") return escaped.replaceAll("'", '&#39;')
+  if (quote === '"') return escaped.replaceAll('"', '&quot;')
+  escaped = escaped.replaceAll('"', '&quot;')
+  return `"${escaped}"`
 }
 
 /**
@@ -149,13 +184,22 @@ export function findCspMetas(html: string): CspMetaMatch[] {
     const at = lower.indexOf('<meta', i)
     if (at === -1) break
     const tagEnd = findTagEnd(html, at)
+    if (tagEnd === -1) {
+      i = at + 5
+      continue
+    }
     const attrsEnd = tagEnd > at && html.charCodeAt(tagEnd - 1) === 62 ? tagEnd - 1 : tagEnd
     const attrs = parseAttrSpans(html, at + 5, attrsEnd)
     const httpEquiv = attrs.find((a) => a.name === 'http-equiv')
     if (httpEquiv !== undefined && httpEquiv.value.trim().toLowerCase() === 'content-security-policy') {
       const content = attrs.find((a) => a.name === 'content')
       if (content !== undefined) {
-        out.push({ policy: content.value, valueStart: content.valueStart, valueEnd: content.valueEnd })
+        out.push({
+          policy: decodeHtmlAttributeValue(content.value),
+          valueStart: content.valueStart,
+          valueEnd: content.valueEnd,
+          quote: content.quote,
+        })
       }
     }
     i = tagEnd
@@ -244,16 +288,37 @@ export async function scriptHashSource(scriptText: string): Promise<string> {
 // Policy editing — pure string surgery on a serialized policy
 // ---------------------------------------------------------------------------
 
+/** CSP keyword source expressions compare ASCII-case-insensitively. Hash
+ * source expressions do not: their base64 payload is case-sensitive. */
+const CSP_KEYWORDS = new Set([
+  "'none'",
+  "'self'",
+  "'unsafe-inline'",
+  "'unsafe-eval'",
+  "'strict-dynamic'",
+  "'unsafe-hashes'",
+  "'wasm-unsafe-eval'",
+  "'report-sample'",
+])
+
+function sameCspSource(a: string, b: string): boolean {
+  if (a === b) return true
+  const lowerA = a.toLowerCase()
+  const lowerB = b.toLowerCase()
+  return CSP_KEYWORDS.has(lowerA) && lowerA === lowerB
+}
+
 /**
- * Patch ONE policy's `script-src` so the given inline-script sources are
- * allowed. Semantics (see module header, review B2#3):
+ * Patch ONE policy's applicable script directives so the given inline-script
+ * sources are allowed. Semantics (see module header, review B2#3):
  *
  *   - `'unsafe-inline'` present → untouched, ok (inline already runs;
  *     adding a hash would DISABLE 'unsafe-inline' per CSP2+).
- *   - `script-src` present → lone `'none'` REPLACED by the sources
+ *   - `script-src` or `script-src-elem` present → lone `'none'` REPLACED by
+ *     the sources
  *     (never emitted alongside — 'none' must be the sole value),
  *     already-present tokens skipped (idempotency).
- *   - NO `script-src` directive → policy returned unchanged, ok:false.
+ *   - NO applicable script directive → policy returned unchanged, ok:false.
  *     The directive is never created: doing so would strip external
  *     scripts of their `default-src` fallback.
  */
@@ -265,28 +330,29 @@ export function patchPolicyScriptSrc(
     .split(';')
     .map((part) => part.trim())
     .filter((part) => part !== '')
-  let found = false
-  let ok = false
+  const found = new Set<string>()
   const next = directives.map((directive) => {
-    const spaceAt = directive.indexOf(' ')
-    const name = (spaceAt === -1 ? directive : directive.slice(0, spaceAt)).toLowerCase()
-    if (name !== 'script-src' || found) return directive
-    found = true
-    const existing =
-      spaceAt === -1 ? [] : directive.slice(spaceAt + 1).split(/\s+/).filter((s) => s !== '')
-    if (existing.includes("'unsafe-inline'")) {
-      ok = true
+    const match = /^(\S+)(?:\s+(.*))?$/.exec(directive)
+    if (match === null) return directive
+    const name = match[1]!.toLowerCase()
+    if ((name !== 'script-src' && name !== 'script-src-elem') || found.has(name)) {
       return directive
     }
-    const set = existing.filter((s) => s !== "'none'")
-    for (const source of sources) {
-      if (!set.includes(source)) set.push(source)
+    found.add(name)
+    const existing = match[2] === undefined ? [] : match[2].split(/\s+/).filter((s) => s !== '')
+    if (existing.some((token) => sameCspSource(token, "'unsafe-inline'"))) {
+      return directive
     }
-    ok = true
-    return `script-src ${set.join(' ')}`
+    const set = existing.filter((s) => !sameCspSource(s, "'none'"))
+    for (const source of sources) {
+      if (!set.some((existingSource) => sameCspSource(existingSource, source))) {
+        set.push(source)
+      }
+    }
+    return `${name} ${set.join(' ')}`
   })
-  if (!found) return { policy, ok: false }
-  return { policy: next.join('; '), ok }
+  if (found.size === 0) return { policy, ok: false }
+  return { policy: next.join('; '), ok: true }
 }
 
 /**
@@ -314,7 +380,10 @@ export function rewriteCspMetaContent(
     const meta = metas[i]!
     const edited = edit(meta.policy)
     if (edited === meta.policy) continue
-    next = next.slice(0, meta.valueStart) + edited + next.slice(meta.valueEnd)
+    next =
+      next.slice(0, meta.valueStart) +
+      serializeCspAttributeValue(edited, meta.quote) +
+      next.slice(meta.valueEnd)
   }
   return next
 }
@@ -370,7 +439,10 @@ export async function allowInlineScripts(
   for (let i = metas.length - 1; i >= 0; i--) {
     const meta = metas[i]!
     if (patched[i] === meta.policy) continue
-    next = next.slice(0, meta.valueStart) + patched[i]! + next.slice(meta.valueEnd)
+    next =
+      next.slice(0, meta.valueStart) +
+      serializeCspAttributeValue(patched[i]!, meta.quote) +
+      next.slice(meta.valueEnd)
   }
   return next
 }

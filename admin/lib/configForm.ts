@@ -27,7 +27,9 @@
 
 import {
   CONFIG_SECTION_KEYS,
+  indexNowEnabled,
   isEmptySeoConfig,
+  schemaEnabled,
   validateSeoConfig,
   type SeoConfigData,
   type SeoSchemaConfig,
@@ -147,9 +149,9 @@ export function formFromConfig(config: SeoConfigData): ConfigFormState {
     siteUrl: site.siteUrl ?? '',
     metaDescription: site.metaDescription ?? '',
     siteTitleTemplate: site.titleTemplate ?? '',
-    indexNowEnabled: config.indexNow?.enabled !== false,
+    indexNowEnabled: indexNowEnabled(config),
     tableRows,
-    schemaEnabled: schema.enabled !== false,
+    schemaEnabled: schemaEnabled(config),
     publisherKind: schema.publisherKind ?? '',
     publisherName: schema.publisherName ?? '',
     publisherLogoUrl: schema.publisherLogoUrl ?? '',
@@ -205,8 +207,7 @@ export function configFromForm(form: ConfigFormState): SeoConfigData {
   }
   if (Object.keys(tables).length > 0) config.tables = tables
 
-  // Only `enabled: false` is representable — enabled is the absent default.
-  if (!form.indexNowEnabled) config.indexNow = { enabled: false }
+  config.indexNow = { enabled: form.indexNowEnabled }
 
   const schema = schemaFromForm(form)
   if (schema !== undefined) config.schema = schema
@@ -223,7 +224,7 @@ export function configFromForm(form: ConfigFormState): SeoConfigData {
 /** The `schema` section a form represents, or undefined when empty. */
 function schemaFromForm(form: ConfigFormState): SeoSchemaConfig | undefined {
   const schema: SeoSchemaConfig = {}
-  if (!form.schemaEnabled) schema.enabled = false
+  schema.enabled = form.schemaEnabled
   if (form.publisherKind !== '') schema.publisherKind = form.publisherKind
   if (form.publisherName.trim() !== '') schema.publisherName = form.publisherName.trim()
   if (form.publisherLogoUrl.trim() !== '') schema.publisherLogoUrl = form.publisherLogoUrl.trim()
@@ -392,7 +393,7 @@ export function mergeDirtyConfig(
   // in the separate seo-state collection, so a save can never destroy it.)
   let indexNow = fresh.indexNow
   if (form.indexNowEnabled !== baseline.indexNowEnabled) {
-    indexNow = form.indexNowEnabled ? undefined : { enabled: false }
+    indexNow = { enabled: form.indexNowEnabled }
   }
   if (indexNow !== undefined) merged.indexNow = indexNow
 
@@ -405,8 +406,7 @@ export function mergeDirtyConfig(
   const schema: SeoSchemaConfig = { ...(fresh.schema ?? {}) }
   for (const field of dirtySchemaFields(form, baseline)) {
     if (field === 'schemaEnabled') {
-      if (form.schemaEnabled) delete schema.enabled
-      else schema.enabled = false
+      schema.enabled = form.schemaEnabled
     } else if (field === 'publisherKind') {
       if (form.publisherKind === '') delete schema.publisherKind
       else schema.publisherKind = form.publisherKind
@@ -688,4 +688,55 @@ export function sampleTemplateVars(form: ConfigFormState): Record<string, string
 export function previewTemplate(template: string, form: ConfigFormState): string {
   if (template.trim() === '') return ''
   return renderTemplate(template, sampleTemplateVars(form))
+}
+
+// ---------------------------------------------------------------------------
+// Publish decoration failures (review 2026-08-15)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /config rides a warning when a publish shipped a page with NO SEO
+ * tags (the publish filter caught an error and passed the document
+ * through untouched). Parsed defensively: a malformed warning must never
+ * stop the settings page loading, and a zero count is NOT a warning.
+ */
+export interface DecorationFailureView {
+  count: number
+  lastAt?: string
+  pages: string[]
+}
+
+export function parseDecorationFailures(body: unknown): DecorationFailureView | undefined {
+  if (body === null || typeof body !== 'object') return undefined
+  const raw = (body as Record<string, unknown>).decorationFailures
+  if (raw === null || typeof raw !== 'object') return undefined
+  const value = raw as Record<string, unknown>
+  const count = value.count
+  if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) return undefined
+  const pages = Array.isArray(value.pages)
+    ? value.pages.filter((p): p is string => typeof p === 'string')
+    : []
+  return {
+    count: Math.floor(count),
+    ...(typeof value.lastAt === 'string' && value.lastAt !== '' ? { lastAt: value.lastAt } : {}),
+    pages,
+  }
+}
+
+/** GET /config warning for an IndexNow submission failure. */
+export interface IndexNowFailureView {
+  status: string
+  lastAt?: string
+}
+
+export function parseIndexNowFailure(body: unknown): IndexNowFailureView | undefined {
+  if (body === null || typeof body !== 'object') return undefined
+  const raw = (body as Record<string, unknown>).indexNowFailure
+  if (raw === null || typeof raw !== 'object') return undefined
+  const value = raw as Record<string, unknown>
+  if (typeof value.status !== 'string' || value.status === '') return undefined
+  return {
+    status: value.status,
+    ...(typeof value.lastAt === 'string' && value.lastAt !== '' ? { lastAt: value.lastAt } : {}),
+  }
 }

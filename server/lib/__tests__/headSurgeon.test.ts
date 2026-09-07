@@ -61,7 +61,40 @@ describe('idempotency', () => {
   })
 })
 
+describe('mask-aware head anchor and raw-text masking', () => {
+  test('does not anchor inside a comment or script string', () => {
+    const input = page(
+      '<!-- decoy </head> -->\n<script>const marker = "</head>";</script>\n<title>Old</title>',
+    )
+    const out = applySeoHead(input, { title: 'New', block: '<meta name="x" content="y">' })
+    expect(out).toContain('<script>const marker = "</head>";</script>')
+    expect(out).toContain('<title>New</title>')
+    const actualClose = out.lastIndexOf('</head>')
+    expect(actualClose).toBeGreaterThan(out.indexOf('<!--seo:start-->'))
+    expect(out.slice(actualClose)).toBe('</head>\n<body><h1>Hi</h1></body>\n</html>')
+  })
+
+  test('does not end a script mask at a non-tag </script prefix', () => {
+    const input = page(
+      '<script>const text = "</scripting><title>decoy</title><meta name=description content=decoy>";</script>' +
+        '<title>Old</title>',
+    )
+    const out = applySeoHead(input, { title: 'New' })
+    expect(out).toContain(
+      '<script>const text = "</scripting><title>decoy</title><meta name=description content=decoy>";</script>',
+    )
+    expect(out).toContain('<title>New</title>')
+  })
+})
+
 describe('title handling', () => {
+  test('a > inside a quoted title attribute does not corrupt the opening tag', () => {
+    const input = page('<title data-x=">">Old</title>')
+    const out = applySeoHead(input, { title: 'New' })
+    expect(out).toContain('<title data-x=">">New</title>')
+    expect(out).not.toContain('<title data-x=">New</title>')
+  })
+
   test('replaces title text, tolerating attributes and multiline content', () => {
     const input = page('<title data-x="y">\n  Old\n  Title\n</title>')
     const out = applySeoHead(input, { title: 'New Title' })
@@ -167,6 +200,13 @@ describe('meta description handling', () => {
     expect(out).toContain('content="og"')
     expect(out).toContain('content="tw"')
     expect(out).toContain('content="new"')
+  })
+
+  test('a head close marker inside a quoted attribute is not the insertion anchor', () => {
+    const input = page('<meta name="description" content="literal </head> text">')
+    const out = applySeoHead(input, { block: '<meta name="x" content="y">' })
+    expect(out).toContain('content="literal </head> text"')
+    expect(out).toContain('<!--seo:start-->\n<meta name="x" content="y">\n<!--seo:end-->\n</head>')
   })
 })
 
@@ -297,6 +337,15 @@ describe('adversarial regressions', () => {
     expect(out).not.toContain('content="real"')
   })
 
+  test('a meta-looking tag inside another quoted attribute never matches', () => {
+    const decoy = '<link data-value="<meta name=description content=\'fake\'>">'
+    const input = page(`${decoy}\n<meta name="description" content="real">`)
+    const out = applySeoHead(input, { metaDescription: 'clean' })
+    expect(out).toContain(decoy)
+    expect(out).toContain('content="clean"')
+    expect(out).not.toContain('content="real"')
+  })
+
   test('finding 5: unquoted attribute values containing "/" are parsed, not mangled', () => {
     const input = page('<meta name=description content=old/path data-keep=1>')
     const out = applySeoHead(input, { metaDescription: 'fresh' })
@@ -314,6 +363,62 @@ describe('adversarial regressions', () => {
     expect(once.split('<!--seo:start-->').length - 1).toBe(1)
     expect(once.split('<!--seo:end-->').length - 1).toBe(1)
     expect(applySeoHead(once, p)).toBe(once)
+  })
+})
+
+describe('round-5 triage: end-tag attributes + abrupt comments', () => {
+  test('item 6: `</title data-x>` closes the title (browser + metaBlock parity)', () => {
+    const input = page('<title>Old</title data-x>\n<meta name="description" content="old">')
+    const out = applySeoHead(input, PAYLOAD)
+    // The EXISTING title is rewritten in place…
+    expect(out).toContain('<title>My Page — Site</title data-x>')
+    expect(out).not.toContain('>Old<')
+    // …so no fallback <title> is appended: the document keeps exactly one.
+    expect(out.split('<title').length - 1).toBe(1)
+    expect(applySeoHead(out, PAYLOAD)).toBe(out)
+  })
+
+  test('item 6: an end tag never closed by a `>` is still not a close', () => {
+    // `</title` running to EOF has no `>`: no content range, so the fallback
+    // title is queued into the block and the original bytes are untouched.
+    const input = '<head><title>Old</title'
+    const out = applySeoHead(input, { title: 'New' })
+    expect(out).toBe(input) // no `</head>` anchor either — pure pass-through
+  })
+
+  test('item 6: everything up to the end tag’s `>` is the end tag (browser parity)', () => {
+    // The HTML tokenizer treats `<meta …>` here as ignored END-TAG attributes,
+    // so the meta is part of the close and the document has no description.
+    const input = page('<title>Old</title\n<meta name="description" content="old">')
+    const out = applySeoHead(input, PAYLOAD)
+    expect(out).toContain('<title>My Page — Site</title\n<meta name="description" content="old">')
+    expect(out).toContain('<!--seo:start-->')
+    expect(out).toContain('<meta name="description" content="A tidy description.">')
+    expect(applySeoHead(out, PAYLOAD)).toBe(out)
+  })
+
+  test('item 14: `<!-->` is a COMPLETE empty comment, not a mask to EOF', () => {
+    const input = page('<!--><title>Old</title>\n<meta name="description" content="old">')
+    const out = applySeoHead(input, PAYLOAD)
+    expect(out).toContain('<title>My Page — Site</title>')
+    expect(out).toContain('content="A tidy description."')
+    expect(out).not.toContain('content="old"')
+    expect(applySeoHead(out, PAYLOAD)).toBe(out)
+  })
+
+  test('item 14: `<!--->` likewise, and `</head>` after one is still found', () => {
+    const input = page('<!---><title>Old</title>')
+    const out = applySeoHead(input, PAYLOAD)
+    expect(out).toContain('<!--seo:start-->')
+    expect(out).toContain('<title>My Page — Site</title>')
+    expect(tail(out)).toBe(tail(input))
+  })
+
+  test('item 14: a REAL comment still masks a decoy title', () => {
+    const input = page('<!-- <title>Decoy</title> --><title>Old</title>')
+    const out = applySeoHead(input, { title: 'New' })
+    expect(out).toContain('<!-- <title>Decoy</title> -->')
+    expect(out).toContain('<title>New</title>')
   })
 })
 

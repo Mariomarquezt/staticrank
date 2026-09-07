@@ -75,7 +75,14 @@ import {
   Textarea,
 } from '@instatic/host-ui'
 import { useEditorStore, usePluginRoutes } from '@instatic/host-hooks'
-import { validateSeoMeta, type FieldError, type SeoMetaPayload } from '../server/seoMeta'
+import {
+  DESCRIPTION_MAX,
+  FOCUS_KEYWORD_MAX,
+  TITLE_MAX,
+  validateSeoMeta,
+  type FieldError,
+  type SeoMetaPayload,
+} from '../server/seoMeta'
 import type { SeoConfigData } from '../server/seoConfig'
 import {
   DESCRIPTION_RECOMMENDED_MAX,
@@ -88,6 +95,7 @@ import {
   applyFormToMeta,
   formFromMeta,
   isMetaDirty,
+  mergeMetaFormAfterSave,
   planMetaClear,
   planMetaSave,
   type MetaFormState,
@@ -201,6 +209,49 @@ async function readErrors(res: Response): Promise<FieldError[]> {
 
 async function readJson<T>(res: Response): Promise<T> {
   return (await res.json()) as T
+}
+
+/**
+ * HARD input ceiling, mirroring the server's storable maxima (TITLE_MAX /
+ * DESCRIPTION_MAX / FOCUS_KEYWORD_MAX, server/seoMeta.ts). The host-ui
+ * `Input`/`Textarea` primitives take no `maxLength` prop (PluginUiInputProps,
+ * vendor src/core/plugin-sdk/builders/adminApp.ts:78-105), so the cap is
+ * applied on change instead — otherwise a megabyte paste is re-analyzed on
+ * every keystroke until Save finally rejects it.
+ *
+ * Measured in UTF-16 code units, exactly like the server's own
+ * `checkBoundedString`, so the cap IS the storable ceiling — but the cut
+ * never splits a surrogate pair in half.
+ */
+function clampInput(value: string, max: number): string {
+  if (value.length <= max) return value
+  const last = value.charCodeAt(max - 1)
+  const splitsPair = max > 0 && last >= 0xd800 && last <= 0xdbff
+  return value.slice(0, splitsPair ? max - 1 : max)
+}
+
+/**
+ * DELETE /meta outcome (`{ deleted, remaining, complete }`, server/index.ts).
+ * `complete: false` means duplicate records survived the sweep and the meta
+ * is still stored — the panel must not show a clean slate over them.
+ *
+ * TOLERANT DEFAULT — complete: an absent/unreadable body (a pre-contract
+ * server, a truncated response) reads as a clean delete, exactly as the
+ * panel behaved before. Only an EXPLICIT `complete: false` triggers the
+ * re-read + warning, so the honest path can never fire as a false alarm.
+ * `remaining` is null when it is not a usable count.
+ */
+export function parseDeleteOutcome(body: unknown): { complete: boolean; remaining: number | null } {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return { complete: true, remaining: null }
+  }
+  const rec = body as Record<string, unknown>
+  if (rec.complete !== false) return { complete: true, remaining: null }
+  const remaining =
+    typeof rec.remaining === 'number' && Number.isFinite(rec.remaining) && rec.remaining >= 0
+      ? Math.floor(rec.remaining)
+      : null
+  return { complete: false, remaining }
 }
 
 /**
@@ -757,9 +808,9 @@ function SuggestControl({
       </Stack>
       {mine?.kind === 'ready' && (
         <Stack gap={4}>
-          {mine.suggestions.map((suggestion) => (
+          {mine.suggestions.map((suggestion, index) => (
             <Button
-              key={suggestion}
+              key={`${field}:${index}:${suggestion}`}
               variant="secondary"
               size="sm"
               onClick={() => onPick(field, suggestion)}
@@ -809,6 +860,9 @@ export function SeoPanel() {
   const [saving, setSaving] = useState(false)
   const [saveErrors, setSaveErrors] = useState<FieldError[]>([])
   const [confirmClear, setConfirmClear] = useState(false)
+  // Set when DELETE /meta reports `complete: false` — stale records survived
+  // the sweep and the panel is showing what is STILL stored, not a clean slate.
+  const [clearWarning, setClearWarning] = useState<string | null>(null)
   const [reloadTick, setReloadTick] = useState(0)
 
   // Request-generation counter (staleness fix): bumped whenever the edited
@@ -816,6 +870,17 @@ export function SeoPanel() {
   // the generation at start and drops its commit on mismatch, so a slow
   // save/clear/load for page A can never strand or corrupt page B's view.
   const generation = useRef(0)
+
+  // In-flight WRITES, keyed by page id (t4-38 reload race). The generation
+  // counter alone only guards the UI COMMIT — it does not order a later
+  // reload GET behind a still-in-flight POST/DELETE for the same page.
+  // Switch away from page A mid-save and back again and the fresh GET can
+  // be served BEFORE the write lands, repainting the pre-save value; the
+  // panel then holds a stale field that the next save writes back over the
+  // committed one. The loader awaits whatever is registered here for the
+  // page it is about to read, so a page's GET can never overtake its own
+  // write. The promise never rejects (runWrite handles its own failures).
+  const pendingWrites = useRef(new Map<string, Promise<void>>())
 
   // Fresh routes helper per render (the host rebuilds it each mount render);
   // kept in a ref so effects/listeners never capture a stale closure.
@@ -829,6 +894,7 @@ export function SeoPanel() {
     setLoad({ kind: 'loading', forPageId: pageId })
     setSaveErrors([])
     setConfirmClear(false)
+    setClearWarning(null)
     // Suggestions belong to the page they were generated for (task 3.8) —
     // a page switch clears any open picker/error (in-flight requests are
     // already generation-invalidated).
@@ -836,11 +902,17 @@ export function SeoPanel() {
     // A write in flight for the PREVIOUS page is generation-invalidated and
     // will never clear its own flag — reset it for the new page here.
     setSaving(false)
-    void loadPanelData(routesRef.current, pageId).then((result) => {
+    void (async () => {
+      // Ordering guard (t4-38): never GET a page's meta while a write for
+      // that SAME page is still in flight — the GET could be served first
+      // and paint the pre-save value back into the panel.
+      const inFlight = pendingWrites.current.get(pageId)
+      if (inFlight !== undefined) await inFlight
+      const result = await loadPanelData(routesRef.current, pageId)
       if (generation.current !== gen) return
       setLoad({ ...result, forPageId: pageId })
       if (result.kind === 'ready') setForm(formFromMeta(result.stored))
-    })
+    })()
     return () => {
       generation.current++ // invalidate in-flight completions for this page
     }
@@ -1154,15 +1226,39 @@ export function SeoPanel() {
   /**
    * Shared write path for Save and Clear: refetch the entry's meta, plan
    * against the FRESH payload, POST/DELETE, commit (generation-guarded).
+   *
+   * The write REGISTERS itself in `pendingWrites` for the duration so a
+   * later reload of the same page (page-switch-and-back) is sequenced
+   * behind it — see the ref's comment. Registration wraps the whole call
+   * because `performWrite` never rejects.
    */
   async function runWrite(
     buildPlan: (fresh: SeoMetaPayload) => MetaSavePlan,
     failureLabel: string,
   ): Promise<void> {
     const targetPageId = pageId as string
+    const inFlight = performWrite(targetPageId, buildPlan, failureLabel)
+    pendingWrites.current.set(targetPageId, inFlight)
+    try {
+      await inFlight
+    } finally {
+      // Only clear OUR entry — a newer write for the same page owns the slot.
+      if (pendingWrites.current.get(targetPageId) === inFlight) {
+        pendingWrites.current.delete(targetPageId)
+      }
+    }
+  }
+
+  async function performWrite(
+    targetPageId: string,
+    buildPlan: (fresh: SeoMetaPayload) => MetaSavePlan,
+    failureLabel: string,
+  ): Promise<void> {
     const gen = generation.current
+    const savedForm = form
     setSaving(true)
     setSaveErrors([])
+    setClearWarning(null)
     try {
       // Refetch-before-write: graft onto the CURRENT server payload, not
       // the possibly-stale one the panel loaded earlier.
@@ -1194,7 +1290,27 @@ export function SeoPanel() {
           if (generation.current === gen) setSaveErrors(errors)
           return
         }
-        nextStored = plan.kind === 'delete' ? {} : await readJson<SeoMetaPayload>(res)
+        if (plan.kind === 'delete') {
+          // DELETE /meta answers { deleted, remaining, complete } and sets
+          // `complete: false` when duplicate records survived the sweep
+          // (server/index.ts — G10 has no unique key, so nothing bounds
+          // duplicates). Installing `{}` on an INCOMPLETE delete paints a
+          // clean slate over meta that is still stored and still publishes
+          // after a reload. Re-read instead, and say so.
+          const outcome = parseDeleteOutcome(await res.json().catch(() => null))
+          if (outcome.complete) {
+            nextStored = {}
+          } else {
+            nextStored = await fetchMeta(routesRef.current, targetPageId)
+            if (generation.current === gen) {
+              setClearWarning(
+                `${outcome.remaining === null ? 'Some' : String(outcome.remaining)} stored record${outcome.remaining === 1 ? '' : 's'} survived the delete — the panel is showing what is still stored. Clear again to remove the rest.`,
+              )
+            }
+          }
+        } else {
+          nextStored = await readJson<SeoMetaPayload>(res)
+        }
       }
       if (generation.current !== gen) return // page switched mid-write — drop
       setLoad((prev) =>
@@ -1202,7 +1318,7 @@ export function SeoPanel() {
           ? { ...prev, stored: nextStored }
           : prev,
       )
-      setForm(formFromMeta(nextStored))
+      setForm((currentForm) => mergeMetaFormAfterSave(nextStored, savedForm, currentForm))
       void refreshConfigRef.current() // pick up settings changed meanwhile
     } catch (err) {
       if (generation.current === gen) {
@@ -1219,7 +1335,11 @@ export function SeoPanel() {
   }
 
   async function save() {
-    await runWrite((fresh) => planMetaSave(fresh, form), 'save failed')
+    // Baseline = the form as loaded; narrows the graft to fields this
+    // operator actually edited (see applyFormToMeta) so a save cannot
+    // revert another admin's concurrent panel edits.
+    const baseline = load.kind === 'ready' ? formFromMeta(load.stored) : undefined
+    await runWrite((fresh) => planMetaSave(fresh, form, baseline), 'save failed')
   }
 
   async function clearOverrides() {
@@ -1252,7 +1372,7 @@ export function SeoPanel() {
           fieldError('title') ??
           `${form.title.length}/${TITLE_RECOMMENDED_MAX} characters — longer titles truncate in results`
         }
-        onChange={(value) => setForm((f) => ({ ...f, title: value }))}
+        onChange={(value) => setForm((f) => ({ ...f, title: clampInput(value, TITLE_MAX) }))}
       />
       {/* Task 3.8 (Pro): AI title suggestions — rendered only when Pro is
           unlocked; disabled with an honest tooltip until /ai/status says a
@@ -1277,7 +1397,9 @@ export function SeoPanel() {
           fieldError('metaDescription') ??
           `${form.metaDescription.length}/${DESCRIPTION_RECOMMENDED_MAX} characters — ~160 shown on desktop, ~120 on mobile`
         }
-        onChange={(value) => setForm((f) => ({ ...f, metaDescription: value }))}
+        onChange={(value) =>
+          setForm((f) => ({ ...f, metaDescription: clampInput(value, DESCRIPTION_MAX) }))
+        }
       />
       {/* Task 3.8 (Pro): AI meta-description suggestions (same affordance). */}
       {proUnlocked && (
@@ -1318,7 +1440,7 @@ export function SeoPanel() {
                     onChange={(value) =>
                       setForm((f) => {
                         const next = f.focusKeywords.length === 0 ? [''] : [...f.focusKeywords]
-                        next[index] = value
+                        next[index] = clampInput(value, FOCUS_KEYWORD_MAX)
                         return { ...f, focusKeywords: next }
                       })
                     }
@@ -1375,7 +1497,10 @@ export function SeoPanel() {
             invalid={keywordError !== undefined}
             description={keywordError ?? 'Scored live in the content analysis below.'}
             onChange={(value) =>
-              setForm((f) => ({ ...f, focusKeywords: [value, ...f.focusKeywords.slice(1)] }))
+              setForm((f) => ({
+                ...f,
+                focusKeywords: [clampInput(value, FOCUS_KEYWORD_MAX), ...f.focusKeywords.slice(1)],
+              }))
             }
           />
           {/* §3.4 second-keyword trigger — shared locked-in-place affordance. */}
@@ -1392,6 +1517,13 @@ export function SeoPanel() {
       {genericErrors.length > 0 && (
         <Alert tone="danger" title="Save failed">
           {genericErrors.map((e) => (e.field !== '' ? `${e.field}: ${e.message}` : e.message)).join('; ')}
+        </Alert>
+      )}
+
+      {/* DELETE reported survivors — an honest partial beats a silent one. */}
+      {clearWarning !== null && (
+        <Alert tone="warning" title="Clear was incomplete">
+          {clearWarning}
         </Alert>
       )}
 
@@ -1457,6 +1589,7 @@ export function SeoPanel() {
               ogTitle={metaNow.ogTitle}
               ogDescription={metaNow.ogDescription}
               ogImage={metaNow.ogImage}
+              twitterCard={metaNow.twitterCard}
               siteUrl={normalizeSiteOrigin(config.site?.siteUrl) ?? ''}
               slug={page.slug}
               siteName={config.site?.siteName ?? ''}

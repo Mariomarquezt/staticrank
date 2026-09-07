@@ -46,8 +46,17 @@ describe('analytics section', () => {
   test('storage round-trip', () => {
     const config: SeoConfigData = { analytics: { enabled: true } }
     const records = serializeSeoConfig(config)
-    expect(records).toEqual([{ key: 'analytics', analyticsEnabled: true }])
-    expect(deserializeSeoConfigRecords(records)).toEqual(config)
+    expect(records).toEqual([
+      { key: 'indexnow', version: 1, indexNowEnabled: true },
+      { key: 'schema', version: 1, schemaEnabled: true },
+      { key: 'analytics', version: 1, analyticsEnabled: true },
+    ])
+    expect(deserializeSeoConfigRecords(records)).toEqual({
+      ...config,
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+      version: 1,
+    })
   })
 })
 
@@ -110,9 +119,22 @@ describe('verification section', () => {
     }
     const records = serializeSeoConfig(config)
     expect(records).toEqual([
-      { key: 'verification', verificationGoogle: 'G', verificationBing: 'B', verificationPinterest: 'P' },
+      { key: 'indexnow', version: 1, indexNowEnabled: true },
+      { key: 'schema', version: 1, schemaEnabled: true },
+      {
+        key: 'verification',
+        version: 1,
+        verificationGoogle: 'G',
+        verificationBing: 'B',
+        verificationPinterest: 'P',
+      },
     ])
-    expect(deserializeSeoConfigRecords(records)).toEqual(config)
+    expect(deserializeSeoConfigRecords(records)).toEqual({
+      ...config,
+      indexNow: { enabled: true },
+      schema: { enabled: true },
+      version: 1,
+    })
     // A hand-edited record with an unsafe value never surfaces it.
     expect(
       deserializeSeoConfigRecords([

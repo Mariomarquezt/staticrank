@@ -7,6 +7,7 @@ import {
   normalizeSiteOrigin,
   resolveAbsoluteUrl,
   resolveSourceTitle,
+  TITLE_TEXT_MAX,
 } from '../metaBlock'
 import type { SeoMetaPayload } from '../seoMeta'
 
@@ -122,6 +123,43 @@ describe('resolveSourceTitle', () => {
       '<title>Plain</title></head>'
     expect(resolveSourceTitle(html)).toBe('Plain')
   })
+
+  // round-5 item 4: the stash reader must mask exactly like headSurgeon's
+  // block remover, or a marker pair that is only TEXT inside a head script
+  // wins over the plugin's real (trailing) block.
+  test('FORGERY GUARD: a marker pair inside a head <script> is not a block', () => {
+    const forged =
+      '<script>var s = "<!--seo:start--><!--seo:source-title:EVIL-->' +
+      '<!--seo:title-fp:Plain--><!--seo:end-->"</script>'
+    const html = `<head>${forged}<title>Plain</title></head><body></body>`
+    expect(resolveSourceTitle(html)).toBe('Plain')
+  })
+
+  test('FORGERY GUARD: a forged pair inside a script loses to the real block', () => {
+    const forged =
+      '<script>var s = "<!--seo:start--><!--seo:source-title:EVIL-->' +
+      '<!--seo:title-fp:Decorated | Site--><!--seo:end-->"</script>'
+    const html =
+      `<head>${forged}<title>Decorated | Site</title><!--seo:start-->\n` +
+      '<!--seo:source-title:Original-->\n<!--seo:title-fp:Decorated | Site-->\n' +
+      '<!--seo:end--></head><body></body>'
+    expect(resolveSourceTitle(html)).toBe('Original')
+  })
+
+  test('FORGERY GUARD: a marker pair nested inside an ordinary comment is inert', () => {
+    const html =
+      '<head><!-- <!--seo:start--><!--seo:source-title:EVIL-->' +
+      '<!--seo:title-fp:Plain--><!--seo:end--> --><title>Plain</title></head>'
+    expect(resolveSourceTitle(html)).toBe('Plain')
+  })
+
+  test('the real block is still read when a script sits before it', () => {
+    const html =
+      '<head><script>var s = "harmless"</script><title>Decorated | Site</title>' +
+      '<!--seo:start-->\n<!--seo:source-title:Original-->\n' +
+      '<!--seo:title-fp:Decorated | Site-->\n<!--seo:end--></head><body></body>'
+    expect(resolveSourceTitle(html)).toBe('Original')
+  })
 })
 
 describe('extractTitleText', () => {
@@ -176,9 +214,31 @@ describe('extractTitleText', () => {
     ).toBeUndefined()
   })
 
+  // round-5 item 5: the document title is the one unbounded input to the head
+  // pipeline (%title%, the source-title stash, the schema graph, audit facts).
+  test('clamps a pathological title to TITLE_TEXT_MAX code points', () => {
+    const huge = 'a'.repeat(10_000)
+    const out = extractTitleText(`<head><title>${huge}</title></head>`)
+    expect(out).toBeDefined()
+    expect([...(out as string)].length).toBe(TITLE_TEXT_MAX)
+  })
+
+  test('clamping never splits a surrogate pair', () => {
+    const out = extractTitleText(
+      `<head><title>${'😀'.repeat(TITLE_TEXT_MAX + 10)}</title></head>`,
+    ) as string
+    expect([...out].length).toBe(TITLE_TEXT_MAX)
+    expect([...out].every((ch) => ch === '😀')).toBe(true)
+  })
+
   test('boundary check: <titles> does not open and </titlex> does not close', () => {
     expect(extractTitleText('<head><titles>not it</titles><title>yes</title></head>')).toBe('yes')
     expect(extractTitleText('<head><title>a</titlex>b</title></head>')).toBe('a</titlex>b')
+  })
+
+  test('abrupt comments `<!-->` / `<!--->` do not hide the real <title> (G1)', () => {
+    expect(extractTitleText('<head><!--><title>Real Title</title></head>')).toBe('Real Title')
+    expect(extractTitleText('<head><!---><title>Real Title</title></head>')).toBe('Real Title')
   })
 
   // Review 3.6 #2 parity guard: extractTitleText is shared with the free

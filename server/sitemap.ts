@@ -81,6 +81,89 @@ export const SEO_SITEMAP_FIELD_IDS = [
  */
 export const SITEMAP_URL_CAP = 5000
 
+/**
+ * Per-ENTRY length bound applied at the emission boundary (round-5 triage
+ * E/t2-13). `SITEMAP_URL_CAP` bounds how MANY entries render, never how
+ * many bytes each one costs: the host's page schema declares
+ * `slug: Type.String()` with no max (vendor src/core/data/schemas.ts) and
+ * `extractTitleText` stores whatever the page's <title> held, so 5,000
+ * pathological multi-KB slugs/titles could exhaust the 64 MB QuickJS heap
+ * while composing a PUBLIC response (sitemap.xml / llms.txt).
+ *
+ * Rule (shared by both documents so they can never disagree about which
+ * pages exist): an entry whose SLUG exceeds this bound is SKIPPED — no
+ * real route is 2,000 chars long, and the <loc> would be unusable anyway.
+ * llms.txt additionally TRUNCATES over-long titles to this bound (a long
+ * title is still a real page). Both are LOUD — the document carries a
+ * comment whenever this bites, the same discipline SITEMAP_URL_CAP uses.
+ */
+export const SITEMAP_ENTRY_MAX_CHARS = 2000
+
+/**
+ * True when the entry may be emitted into a public document — i.e. its
+ * slug fits `SITEMAP_ENTRY_MAX_CHARS`. Shared by buildSitemapXml and
+ * buildLlmsTxt (see SITEMAP_ENTRY_MAX_CHARS).
+ */
+export function isEmittableEntry(
+  entry: SitemapEntry,
+  maxChars: number = SITEMAP_ENTRY_MAX_CHARS,
+): boolean {
+  return typeof entry.slug === 'string' && entry.slug.length <= maxChars
+}
+
+/**
+ * AGGREGATE budget, in characters, for the percent-encoded URLs one public
+ * document may retain (round-5 wave-2 O#4).
+ *
+ * `SITEMAP_ENTRY_MAX_CHARS` bounds each entry and `SITEMAP_URL_CAP` bounds
+ * how many are RENDERED, but neither bounds the mapped set: the map runs
+ * over EVERY emittable entry before the cap slices it, and `pageUrl`
+ * percent-encodes (a non-ASCII BMP character becomes 9 characters). 5,000
+ * maximum-length non-ASCII slugs therefore built ~90M characters of URL
+ * (~180 MB) inside the map — past the 64 MB QuickJS heap, while composing
+ * an anonymous public response.
+ *
+ * 2M characters is ~6x the worst REALISTIC document (5,000 URLs at ~60
+ * encoded characters each is ~300K) and leaves the whole compose — mapped
+ * URLs, the sorted array and the joined output — inside a few MB.
+ */
+export const SITEMAP_URL_BUDGET_CHARS = 2_000_000
+
+/** One mapped entry plus its absolute, percent-encoded URL. */
+export interface MappedSitemapEntry<E> {
+  entry: E
+  url: string
+}
+
+/**
+ * Map entries to URLs while charging an AGGREGATE encoded-output budget:
+ * building stops at the first URL that would push the running total past
+ * `budget`, and the number of entries left unmapped is returned so the
+ * caller can say so in the document (silent caps forbidden — the same
+ * discipline as SITEMAP_URL_CAP and SITEMAP_ENTRY_MAX_CHARS).
+ *
+ * Entries are consumed in input order; the caller sorts what survives.
+ * Budget exhaustion is therefore a pathological-content signal, not an
+ * ordering guarantee — a document that drops entries here is one whose
+ * slugs are already unusable as routes.
+ */
+export function mapEntriesWithinBudget<E>(
+  entries: readonly E[],
+  toUrl: (entry: E) => string,
+  budget: number = SITEMAP_URL_BUDGET_CHARS,
+): { mapped: MappedSitemapEntry<E>[]; overBudget: number } {
+  const mapped: MappedSitemapEntry<E>[] = []
+  let used = 0
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!
+    const url = toUrl(entry)
+    if (used + url.length > budget) return { mapped, overBudget: entries.length - i }
+    used += url.length
+    mapped.push({ entry, url })
+  }
+  return { mapped, overBudget: 0 }
+}
+
 /** Host storage list page size (StorageListOptionsSchema caps limit at 1000). */
 export const SITEMAP_LIST_PAGE_SIZE = 1000
 
@@ -134,13 +217,31 @@ export interface PageStash {
  * `?v=<N>` query strings (moduleJsBundle injection) and hole shells carry
  * `data-instatic-version="<N>"` — both change on EVERY full publish even
  * when the page content did not. Hashing them would rewrite every record
- * and re-ping IndexNow on every publish. Normalization drops `?v=…` from
- * src/href attribute values and removes data-instatic-version attributes;
- * everything else hashes verbatim.
+ * and re-ping IndexNow on every publish. Normalization drops the numeric
+ * `v` parameter from src/href attribute values and removes
+ * data-instatic-version attributes;
+ * other query parameters and everything else hashes verbatim.
  */
+function withoutPublishVersion(value: string): string {
+  const queryStart = value.indexOf('?')
+  if (queryStart === -1) return value
+  const fragmentStart = value.indexOf('#', queryStart + 1)
+  const queryEnd = fragmentStart === -1 ? value.length : fragmentStart
+  const query = value.slice(queryStart + 1, queryEnd)
+  const parts = query.split('&')
+  const kept = parts.filter((part) => !/^v=\d+$/i.test(part))
+  if (kept.length === parts.length) return value
+  const fragment = fragmentStart === -1 ? '' : value.slice(fragmentStart)
+  return `${value.slice(0, queryStart)}${kept.length > 0 ? `?${kept.join('&')}` : ''}${fragment}`
+}
+
 export function normalizeForFingerprint(html: string): string {
   return html
-    .replace(/((?:src|href)="[^"]*?)\?v=[^"]*/gi, '$1')
+    .replace(
+      /(\s(?:src|href)\s*=\s*)(["'])([\s\S]*?)\2/gi,
+      (_match: string, prefix: string, quote: string, value: string) =>
+        `${prefix}${quote}${withoutPublishVersion(value)}${quote}`,
+    )
     .replace(/\s+data-instatic-version="[^"]*"/gi, '')
 }
 
@@ -347,12 +448,17 @@ export interface SitemapXmlOptions {
   /** True when the storage read may have been truncated (list-cap hit). */
   truncatedLoad?: boolean
   urlCap?: number
+  /** Per-entry slug length bound (default SITEMAP_ENTRY_MAX_CHARS). */
+  entryMaxChars?: number
+  /** Aggregate encoded-URL budget (default SITEMAP_URL_BUDGET_CHARS). */
+  urlBudgetChars?: number
 }
 
 /**
  * Render the <urlset> document. Deterministic output: entries are sorted
- * by URL. Caps are LOUD — an XML comment records both cap truncation and
- * a possibly-truncated storage read (silent caps forbidden).
+ * by URL. Caps are LOUD — an XML comment records cap truncation, entries
+ * dropped for an over-long slug, and a possibly-truncated storage read
+ * (silent caps forbidden).
  */
 export function buildSitemapXml(
   entries: readonly SitemapEntry[],
@@ -360,8 +466,26 @@ export function buildSitemapXml(
   options: SitemapXmlOptions = {},
 ): string {
   const cap = options.urlCap ?? SITEMAP_URL_CAP
-  const sorted = [...entries]
-    .map((entry) => ({ entry, loc: pageUrl(siteUrl, entry.slug) }))
+  const entryMax = options.entryMaxChars ?? SITEMAP_ENTRY_MAX_CHARS
+  // Per-entry length gate BEFORE any URL is built: pageUrl percent-encodes
+  // every segment (up to 9x the input), so an oversize slug must never
+  // reach it. See SITEMAP_ENTRY_MAX_CHARS.
+  const emittable = entries.filter((entry) => isEmittableEntry(entry, entryMax))
+  const oversize = entries.length - emittable.length
+  // Storage is newest-first, which is not a stable page order. Sort on the
+  // already-bounded raw slug before URL mapping so budget survivors do not
+  // depend on record order; the mapped survivors are still sorted by URL.
+  emittable.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+  // AGGREGATE encoded-output budget (round-5 wave-2 O#4): the per-entry
+  // gate above bounds one slug, never the whole mapped set. See
+  // SITEMAP_URL_BUDGET_CHARS.
+  const { mapped, overBudget } = mapEntriesWithinBudget(
+    emittable,
+    (entry) => pageUrl(siteUrl, entry.slug),
+    options.urlBudgetChars ?? SITEMAP_URL_BUDGET_CHARS,
+  )
+  const sorted = mapped
+    .map(({ entry, url }) => ({ entry, loc: url }))
     .sort((a, b) => (a.loc < b.loc ? -1 : a.loc > b.loc ? 1 : 0))
   const capped = sorted.slice(0, cap)
 
@@ -371,6 +495,16 @@ export function buildSitemapXml(
   ]
   if (sorted.length > cap) {
     lines.push(`<!-- truncated: showing ${cap} of ${sorted.length} URLs (cap ${cap}) -->`)
+  }
+  if (oversize > 0) {
+    lines.push(
+      `<!-- skipped: ${oversize} entr${oversize === 1 ? 'y' : 'ies'} with a slug longer than ${entryMax} characters -->`,
+    )
+  }
+  if (overBudget > 0) {
+    lines.push(
+      `<!-- skipped: ${overBudget} entr${overBudget === 1 ? 'y' : 'ies'} past the ${options.urlBudgetChars ?? SITEMAP_URL_BUDGET_CHARS}-character total URL budget -->`,
+    )
   }
   if (options.truncatedLoad === true) {
     lines.push('<!-- warning: page index read hit the storage list cap; the list may be incomplete -->')

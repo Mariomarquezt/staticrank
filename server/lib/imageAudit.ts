@@ -1,10 +1,18 @@
 /**
  * Image SEO checks for rendered HTML.
  *
- * This module deliberately has no imports: it is also loaded by the
- * QuickJS-WASM plugin sandbox. The document is walked from left to right;
- * comments and raw-ish elements are skipped before image tags are parsed.
+ * This module takes no host, SDK or DOM dependency: it is also loaded by the
+ * QuickJS-WASM plugin sandbox (and by the editor bundle). Its only import is
+ * the analysis lib's `decodeEntities`, which is dependency-free under exactly
+ * the same rules and ships in every bundle this module does — attribute
+ * values must be decoded before the semantic checks (`alt="&#32;"` carries no
+ * accessible name; an entity-obfuscated `data:` src is still inline), and
+ * forking a second entity table here is how the two scanners drift apart.
+ * The document is walked from left to right; comments and raw-ish elements
+ * are skipped before image tags are parsed.
  */
+
+import { decodeEntities } from './analysis/extract'
 
 export interface ImageAuditFinding {
   code:
@@ -21,6 +29,8 @@ export interface ImageAuditFinding {
 
 export interface ImageAuditResult {
   totalImages: number
+  /** Full count of images without an alt attribute, independent of findings cap. */
+  missingAlt: number
   findings: ImageAuditFinding[]
 }
 
@@ -45,14 +55,38 @@ interface ImageRecord {
   alt: string | null
   hasAlt: boolean
   decorative: boolean
+  /** A width attribute that parses as a positive integer (see hasPositiveDimension). */
   hasWidth: boolean
+  /** A height attribute that parses as a positive integer. */
   hasHeight: boolean
   picture: PictureFrame | undefined
 }
 
 const GENERIC_ALT_RE = /^(img|image|photo|dsc|screenshot)[-_ ]?\d*$/i
 
-const RAW_ELEMENT_NAMES = ['script', 'style', 'noscript', 'template']
+const RAW_ELEMENT_NAMES = ['script', 'style', 'noscript', 'template', 'textarea', 'title']
+
+/** Bound both report size and the number of findings from hostile pages. */
+export const IMAGE_FINDINGS_MAX = 100
+export const IMAGE_FINDING_SRC_MAX = 256
+
+/**
+ * Max `<img>` elements whose attributes are RETAINED for the findings pass.
+ * `totalImages` and `missingAlt` are counted during the scan and stay EXACT
+ * past this cap — only per-image detail (and therefore further findings,
+ * themselves capped at 100) stops accumulating, so a page with a million
+ * images can no longer make the publish tick allocate a million records.
+ */
+export const IMAGE_RECORDS_MAX = 10_000
+
+/**
+ * Max open elements tracked while walking. The stack exists only to answer
+ * "is this img a direct child of a <picture> with a <source> sibling", so
+ * dropping the OLDEST (outermost) entries costs nothing that matters, and it
+ * turns the unmatched-close rescan — which walks the whole stack per closing
+ * tag — from O(n²) into a linear scan with a constant factor.
+ */
+export const IMAGE_STACK_MAX = 512
 
 const VOID_ELEMENT_NAMES = [
   'area',
@@ -98,14 +132,20 @@ function hasTagNameAt(lower: string, start: number, name: string): boolean {
 /** Find a tag's closing `>` while respecting both quote types. */
 function findTagEnd(html: string, start: number): number {
   let quote = 0
+  let afterEquals = false
   for (let i = start + 1; i < html.length; i++) {
     const code = html.charCodeAt(i)
     if (quote !== 0) {
       if (code === quote) quote = 0
-    } else if (code === 34 || code === 39) {
+    } else if (code === 61 /* = */) {
+      afterEquals = true
+    } else if (afterEquals && (code === 34 || code === 39)) {
       quote = code
+      afterEquals = false
     } else if (code === 62) {
       return i + 1
+    } else if (afterEquals && !isSpace(code)) {
+      afterEquals = false
     }
   }
   // Treat an unterminated tag as extending to the document end. This is
@@ -113,7 +153,19 @@ function findTagEnd(html: string, start: number): number {
   return html.length
 }
 
+/**
+ * End of the comment opening at `start` (which starts `<!--`).
+ *
+ * The two SPEC-VALID abrupt forms `<!-->` and `<!--->` are COMPLETE, empty
+ * comments (HTML tokenizer: comment-start and comment-start-dash both take
+ * `>` as "abrupt closing of empty comment"). Scanning them for a `-->` that
+ * is not there masked the rest of the document, so `<!--><img src=x>`
+ * reported totalImages 0 — a false pass. A genuinely unterminated comment
+ * still masks to the end of the input, which is what a browser does too.
+ */
 function findCommentEnd(html: string, start: number): number {
+  if (html.charCodeAt(start + 4) === 62) return start + 5
+  if (html.charCodeAt(start + 4) === 45 && html.charCodeAt(start + 5) === 62) return start + 6
   for (let i = start + 4; i + 2 < html.length; i++) {
     if (html.charCodeAt(i) === 45 && html.charCodeAt(i + 1) === 45 && html.charCodeAt(i + 2) === 62) {
       return i + 3
@@ -196,7 +248,10 @@ function parseAttributes(html: string, start: number, end: number): Attribute[] 
       }
     }
     // A slash immediately before the tag end is syntax, not an attribute.
-    if (name !== '/') attrs.push({ name, value })
+    // Values are entity-decoded (parity with capture.ts's parseTagAttrs):
+    // the semantic checks below read the value a browser would see, not the
+    // source bytes. A bare attribute keeps its `null` (absent value).
+    if (name !== '/') attrs.push({ name, value: value === null ? null : decodeEntities(value) })
   }
   return attrs
 }
@@ -220,32 +275,70 @@ function countCodePoints(value: string): number {
   return count
 }
 
+/** `role="none"` is ARIA 1.1's synonym for `role="presentation"` — both mark
+ * the image decorative and both silence `empty-alt`. */
 function isDecorative(attrs: Attribute[]): boolean {
   const role = firstAttribute(attrs, 'role')
   const ariaHidden = firstAttribute(attrs, 'aria-hidden')
+  const roleValue = role === undefined ? '' : (role.value || '').trim().toLowerCase()
   return (
-    (role !== undefined && (role.value || '').trim().toLowerCase() === 'presentation') ||
+    roleValue === 'presentation' ||
+    roleValue === 'none' ||
     (ariaHidden !== undefined && (ariaHidden.value || '').trim().toLowerCase() === 'true')
   )
 }
 
+/** A width/height attribute that actually constrains layout: HTML dimension
+ * attributes are non-negative integers, and only a POSITIVE one lets the
+ * browser reserve space before the image loads. `width="banana"`,
+ * `width="50%"` and `width="0"` are all as good as absent for CLS. */
+function hasPositiveDimension(attrs: Attribute[], name: string): boolean {
+  const attr = firstAttribute(attrs, name)
+  if (attr === undefined) return false
+  const value = (attr.value || '').trim()
+  if (!/^[0-9]+$/.test(value)) return false
+  return parseInt(value, 10) > 0
+}
+
+/** Push an open element, dropping the OUTERMOST entry once the stack is
+ * full — see IMAGE_STACK_MAX. */
+function pushElement(stack: ElementEntry[], entry: ElementEntry): void {
+  if (stack.length >= IMAGE_STACK_MAX) stack.shift()
+  stack.push(entry)
+}
+
 function addFinding(findings: ImageAuditFinding[], code: ImageAuditFinding['code'], image: ImageRecord): void {
-  findings.push({ code, src: image.src, index: image.index })
+  if (findings.length >= IMAGE_FINDINGS_MAX) return
+  const src =
+    image.src.length <= IMAGE_FINDING_SRC_MAX
+      ? image.src
+      : image.src.slice(0, IMAGE_FINDING_SRC_MAX - 1) + '…'
+  findings.push({ code, src, index: image.index })
 }
 
 /**
  * Audit all real <img> elements in a rendered HTML document.
  *
- * Empty alt is exempted when role="presentation" or aria-hidden="true" is
- * present, because those attributes explicitly mark the image decorative.
+ * Empty alt is exempted when role="presentation", role="none" (its ARIA 1.1
+ * synonym) or aria-hidden="true" is present, because those attributes
+ * explicitly mark the image decorative.
  * Missing dimensions are exempted only for an img that is a direct child of
  * a <picture> containing a direct-child <source> sibling. The source may occur
  * before or after the img; the decision is deferred until scanning completes.
+ * width/height must PARSE as positive integers to count — a present but
+ * unusable value reserves no space, so it is not a dimension.
+ *
+ * Resource bounds: `totalImages`/`missingAlt` are exact for any input, while
+ * retained per-image detail stops at IMAGE_RECORDS_MAX and the open-element
+ * stack at IMAGE_STACK_MAX (both documented at their declarations).
  */
 export function auditImages(html: string): ImageAuditResult {
   const lower = html.toLowerCase()
   const images: ImageRecord[] = []
   const stack: ElementEntry[] = []
+  // Counted during the scan so they stay EXACT past IMAGE_RECORDS_MAX.
+  let totalImages = 0
+  let missingAlt = 0
   let i = 0
 
   while (i < html.length) {
@@ -263,12 +356,10 @@ export function auditImages(html: string): ImageAuditResult {
       if (!hasTagNameAt(lower, lt + 1, rawName)) continue
 
       const openEnd = findTagEnd(html, lt)
-      if (!isSelfClosing(html, openEnd)) {
-        const closeStart = findRawClose(html, lower, openEnd, rawName)
-        i = closeStart === -1 ? html.length : findTagEnd(html, closeStart)
-      } else {
-        i = openEnd
-      }
+      // HTML raw/RCDATA elements are not self-closing: a slash before `>` is
+      // ignored by the HTML parser, so `<script src=x />` still owns its body.
+      const closeStart = findRawClose(html, lower, openEnd, rawName)
+      i = closeStart === -1 ? html.length : findTagEnd(html, closeStart)
       skippedRaw = true
       break
     }
@@ -294,9 +385,9 @@ export function auditImages(html: string): ImageAuditResult {
             if (parent.name === 'picture' && parent.picture) parent.picture.hasSiblingSource = true
           }
           if (roughName.name === 'picture' && !selfClosing) {
-            stack.push({ name: 'picture', picture: { hasSiblingSource: false } })
+            pushElement(stack, { name: 'picture', picture: { hasSiblingSource: false } })
           } else if (!selfClosing && !isVoidElement(roughName.name)) {
-            stack.push({ name: roughName.name })
+            pushElement(stack, { name: roughName.name })
           }
         }
         i = tagEnd
@@ -316,16 +407,22 @@ export function auditImages(html: string): ImageAuditResult {
         ? stack[stack.length - 1].picture
         : undefined
 
-    images.push({
-      index: images.length,
-      src: srcAttribute?.value || '',
-      alt: altAttribute?.value || null,
-      hasAlt: altAttribute !== undefined,
-      decorative: isDecorative(attrs),
-      hasWidth: firstAttribute(attrs, 'width') !== undefined,
-      hasHeight: firstAttribute(attrs, 'height') !== undefined,
-      picture,
-    })
+    const hasAlt = altAttribute !== undefined
+    const index = totalImages
+    totalImages++
+    if (!hasAlt) missingAlt++
+    if (images.length < IMAGE_RECORDS_MAX) {
+      images.push({
+        index,
+        src: srcAttribute?.value || '',
+        alt: altAttribute?.value || null,
+        hasAlt,
+        decorative: isDecorative(attrs),
+        hasWidth: hasPositiveDimension(attrs, 'width'),
+        hasHeight: hasPositiveDimension(attrs, 'height'),
+        picture,
+      })
+    }
     i = tagEnd
   }
 
@@ -353,5 +450,5 @@ export function auditImages(html: string): ImageAuditResult {
     }
   }
 
-  return { totalImages: images.length, findings }
+  return { totalImages, missingAlt, findings }
 }

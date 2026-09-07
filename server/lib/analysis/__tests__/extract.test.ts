@@ -27,8 +27,19 @@ describe('extractTextFromHtml', () => {
   })
 
   test('script bodies are masked, including markup inside them', () => {
+    // A script renders NOTHING, so it is not a block boundary: the text on
+    // either side belongs to the same rendered block (round-5 item 26 — this
+    // used to flush and yield 'a\nb').
     const html = '<div>a<script>if(1<2){document.write("<b>never</b>")}</script>b</div>'
-    expect(extractTextFromHtml(html)).toBe('a\nb')
+    expect(extractTextFromHtml(html)).toBe('ab')
+  })
+
+  test('a masked element that renders nothing does not split a word (round-5 item 26)', () => {
+    expect(extractTextFromHtml('<p>key<script></script>word</p>')).toBe('keyword')
+    expect(extractTextFromHtml('<p>key<style>.a{}</style>word</p>')).toBe('keyword')
+    // …but masked elements that OCCUPY LAYOUT stay word boundaries.
+    expect(extractTextFromHtml('<p>a<svg><text>q</text></svg>b</p>')).toBe('a b')
+    expect(extractTextFromHtml('<p>a<iframe src="x"></iframe>b</p>')).toBe('a b')
   })
 
   test('style and noscript are masked; unterminated script swallows to EOF', () => {
@@ -78,8 +89,62 @@ describe('extractTextFromHtml', () => {
     expect(extractTextFromHtml('<svg><text>x</text><svg></svg><text>y</text></svg>z')).toBe('z')
   })
 
-  test('self-closing masked element does not swallow the document', () => {
-    expect(extractTextFromHtml('<template/>hello')).toBe('hello')
+  test('selfClosing is honoured only for foreign content (round-5 item 25)', () => {
+    // svg is foreign content: `<svg/>` really is an empty element.
+    expect(extractTextFromHtml('<svg/>hello')).toBe('hello')
+    // HTML raw-text/RCDATA elements are NOT self-closing — the parser ignores
+    // the slash, so the body still belongs to the element (same rule as
+    // imageAudit.ts). `<script/>hidden</script>` must hide `hidden`.
+    expect(extractTextFromHtml('<script/>hidden</script>shown')).toBe('shown')
+    expect(extractTextFromHtml('<template/>hidden</template>shown')).toBe('shown')
+    expect(extractTextFromHtml('<textarea/>hidden</textarea>shown')).toBe('shown')
+  })
+
+  test('comments inside a <template> are comments, not tags (round-5 item 24)', () => {
+    expect(extractTextFromHtml('<template><!-- <template> --></template><p>visible</p>')).toBe(
+      'visible',
+    )
+    // …and the close tag inside a comment does not end the region early.
+    expect(extractTextFromHtml('<template>a<!-- </template> -->b</template><p>visible</p>')).toBe(
+      'visible',
+    )
+    // Real nesting is still depth-tracked.
+    expect(extractTextFromHtml('<svg><!-- <svg> --><text>x</text></svg>after')).toBe('after')
+  })
+
+  test('abrupt comments `<!-->` / `<!--->` end immediately (round-5 item 14)', () => {
+    expect(extractTextFromHtml('<!--><p>visible</p>')).toBe('visible')
+    expect(extractTextFromHtml('<!---><p>visible</p>')).toBe('visible')
+    // A normal empty comment still behaves.
+    expect(extractTextFromHtml('<!----><p>visible</p>')).toBe('visible')
+    // A genuinely unterminated comment still masks to EOF.
+    expect(extractTextFromHtml('a<!-- never closed <p>x</p>')).toBe('a')
+  })
+
+  test('a tag name must start with a LETTER (round-5 item 27)', () => {
+    expect(extractTextFromHtml('<p>I <3 SEO and math</p>')).toBe('I <3 SEO and math')
+    expect(extractTextFromHtml('<p>2 <1 is false</p>')).toBe('2 <1 is false')
+    // Real tags are unaffected, including namespaced and digit-suffixed names.
+    expect(extractTextFromHtml('<h2>Head</h2><svg:rect></svg:rect><p>Body</p>')).toBe('Head\nBody')
+  })
+
+  test('entity lookup reads OWN properties only (round-5 item 28)', () => {
+    expect(decodeEntities('&toString;')).toBe('&toString;')
+    expect(decodeEntities('&__proto__;')).toBe('&__proto__;')
+    expect(decodeEntities('&constructor;')).toBe('&constructor;')
+    expect(extractTextFromHtml('<p>a &toString; b</p>')).toBe('a &toString; b')
+    // Real named entities still decode.
+    expect(decodeEntities('&amp;&nbsp;&copy;')).toBe('& ©')
+  })
+
+  test('an unclosed heading does not swallow later paragraphs (round-5 item 29)', () => {
+    const doc = parseHtml('<h2>Title<p>First para</p><p>Second para</p>')
+    expect(doc.headings).toEqual([{ level: 2, text: 'Title' }])
+    expect(doc.paragraphs).toEqual(['First para', 'Second para'])
+    // Well-formed headings are unchanged.
+    const ok = parseHtml('<h2>Title</h2><p>Body</p>')
+    expect(ok.headings).toEqual([{ level: 2, text: 'Title' }])
+    expect(ok.paragraphs).toEqual(['Body'])
   })
 
   test('CDATA is one opaque masked region through ]]> (finding 6)', () => {

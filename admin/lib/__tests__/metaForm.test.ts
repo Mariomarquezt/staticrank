@@ -4,6 +4,7 @@ import {
   formFromMeta,
   isMetaDirty,
   metaEquals,
+  mergeMetaFormAfterSave,
   normalizeKeywords,
   planMetaClear,
   scoredFreeKeywords,
@@ -128,6 +129,87 @@ describe('planMetaSave', () => {
       kind: 'post',
       payload: { title: 'T-edited', canonical: '/new' },
     })
+  })
+})
+
+describe('dirty graft — only edited panel fields are written (t4-31)', () => {
+  const baseline = { title: 'A-title', metaDescription: 'A-desc', focusKeywords: ['a-kw'] }
+
+  test("admin A's description save does NOT revert admin B's title", () => {
+    // A loaded the panel (baseline), B then changed the title; A edits
+    // only the description. Without the baseline the graft writes A's
+    // stale title over B's.
+    const fresh: SeoMetaPayload = {
+      title: 'B-title',
+      metaDescription: 'A-desc',
+      focusKeywords: ['a-kw'],
+    }
+    const form = { ...baseline, metaDescription: 'A-desc-edited' }
+    expect(planMetaSave(fresh, form, baseline)).toEqual({
+      kind: 'post',
+      payload: {
+        title: 'B-title',
+        metaDescription: 'A-desc-edited',
+        focusKeywords: ['a-kw'],
+      },
+    })
+  })
+
+  test("B's concurrent keyword list survives an untouched keyword field", () => {
+    const fresh: SeoMetaPayload = { title: 'A-title', focusKeywords: ['b-kw-1', 'b-kw-2'] }
+    const form = { ...baseline, title: 'A-title-edited' }
+    expect(applyFormToMeta(fresh, form, baseline)).toEqual({
+      title: 'A-title-edited',
+      focusKeywords: ['b-kw-1', 'b-kw-2'],
+    })
+  })
+
+  test('a CLEARED field is still dirty — clearing removes it from the payload', () => {
+    const fresh: SeoMetaPayload = { title: 'A-title', metaDescription: 'B-desc' }
+    const form = { ...baseline, title: '   ' }
+    expect(applyFormToMeta(fresh, form, baseline)).toEqual({ metaDescription: 'B-desc' })
+  })
+
+  test('nothing edited → the fresh payload is returned untouched (noop plan)', () => {
+    const fresh: SeoMetaPayload = { title: 'B-title', metaDescription: 'B-desc', canonical: '/c' }
+    expect(planMetaSave(fresh, baseline, baseline)).toEqual({ kind: 'noop' })
+  })
+
+  test('omitting the baseline keeps the graft-everything behavior (preview path)', () => {
+    const fresh: SeoMetaPayload = { title: 'B-title' }
+    expect(applyFormToMeta(fresh, baseline)).toEqual({
+      title: 'A-title',
+      metaDescription: 'A-desc',
+      focusKeywords: ['a-kw'],
+    })
+  })
+
+  test('a keyword reorder counts as an edit (list compared positionally)', () => {
+    const form = { ...baseline, focusKeywords: ['b-kw', 'a-kw'] }
+    const fresh: SeoMetaPayload = { focusKeywords: ['server-kw'] }
+    expect(applyFormToMeta(fresh, form, baseline)).toEqual({ focusKeywords: ['b-kw', 'a-kw'] })
+  })
+})
+
+describe('mergeMetaFormAfterSave', () => {
+  test('keeps fields typed while the save was in flight', () => {
+    const savedForm = { title: 'Foo', metaDescription: 'D', focusKeywords: ['coffee'] }
+    const typedDuringSave = {
+      title: 'FooBar',
+      metaDescription: 'D',
+      focusKeywords: ['coffee', 'beans'],
+    }
+    expect(mergeMetaFormAfterSave({ title: 'Foo', metaDescription: 'D' }, savedForm, typedDuringSave)).toEqual(
+      typedDuringSave,
+    )
+  })
+
+  test('uses the server-normalized value for fields unchanged during the save', () => {
+    const savedForm = { title: 'Foo', metaDescription: 'D', focusKeywords: ['coffee'] }
+    const currentForm = { title: 'Foo', metaDescription: 'D', focusKeywords: ['coffee'] }
+    expect(mergeMetaFormAfterSave({ title: 'Foo', focusKeywords: ['coffee beans'] }, savedForm, currentForm)).toEqual(
+      { title: 'Foo', metaDescription: '', focusKeywords: ['coffee beans'] },
+    )
   })
 })
 

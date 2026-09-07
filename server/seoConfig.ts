@@ -66,8 +66,9 @@ export interface SeoTableConfig {
 }
 
 /**
- * IndexNow ADMIN config (task 2.2). Only the toggle lives here — absent =
- * enabled (read via `indexNowEnabled(config)`). Everything the SERVER
+ * IndexNow ADMIN config (task 2.2). Only the toggle lives here. Legacy
+ * versionless configs keep absent = enabled; versioned configs require an
+ * explicit true (read via `indexNowEnabled(config)`). Everything the SERVER
  * writes (the submission key, last-submission status) lives in the
  * separate `seo-state` collection (server/seoState.ts): POST /config is a
  * full replace and DELETE /config wipes this collection, so server-owned
@@ -78,9 +79,9 @@ export interface SeoIndexNowConfig {
 }
 
 /**
- * schema.org graph ADMIN config (task 2.3). `enabled` defaults ON —
- * only `false` is stored (read via `schemaEnabled(config)`, same
- * default-ON style as IndexNow). Publisher fields feed the
+ * schema.org graph ADMIN config (task 2.3). Legacy versionless configs
+ * default ON; versioned configs require an explicit true (read via
+ * `schemaEnabled(config)`). Publisher fields feed the
  * Organization/Person node in server/lib/schemaGraph.ts; the settings-UI
  * tab arrives next wave (server-side validation only for now).
  */
@@ -125,6 +126,8 @@ export interface SeoVerificationConfig {
 }
 
 export interface SeoConfigData {
+  /** Stored config shape version; absent means the original pre-version shape. */
+  version?: number
   site?: SeoSiteDefaults
   tables?: Record<string, SeoTableConfig>
   indexNow?: SeoIndexNowConfig
@@ -133,14 +136,21 @@ export interface SeoConfigData {
   verification?: SeoVerificationConfig
 }
 
-/** IndexNow defaults ON — absent/undefined `enabled` means enabled. */
+/** Current stored config shape version. */
+export const SEO_CONFIG_VERSION = 1
+
+/** IndexNow keeps the original default only for configs without a version. */
 export function indexNowEnabled(config: SeoConfigData): boolean {
-  return config.indexNow?.enabled !== false
+  return config.version === undefined
+    ? config.indexNow?.enabled !== false
+    : config.version === SEO_CONFIG_VERSION && config.indexNow?.enabled === true
 }
 
-/** Schema graph defaults ON — absent/undefined `enabled` means enabled. */
+/** Schema graph keeps the original default only for configs without a version. */
 export function schemaEnabled(config: SeoConfigData): boolean {
-  return config.schema?.enabled !== false
+  return config.version === undefined
+    ? config.schema?.enabled !== false
+    : config.version === SEO_CONFIG_VERSION && config.schema?.enabled === true
 }
 
 /** Analytics defaults OFF (opt-in data collection) — only `true` enables. */
@@ -186,7 +196,14 @@ export const SEPARATOR_MAX = 20
 export const TITLE_TEMPLATE_MAX = 300
 export const PUBLISHER_NAME_MAX = 200
 export const SAME_AS_MAX = 10
+/**
+ * Worst-case serialized sameAs JSON (read gate for parseStoredSameAs):
+ * `[` + SAME_AS_MAX × (`"` + URL_MAX fully-escaped chars ×6 + `",`) + `]`.
+ */
+export const SAME_AS_JSON_MAX = 2 + SAME_AS_MAX * (2 + URL_MAX * 6 + 1)
 export const VERIFICATION_TOKEN_MAX = 200
+/** Table slugs share the existing URL-sized identifier budget. */
+export const TABLE_SLUG_MAX = URL_MAX
 
 /**
  * Flat record-data field ids, matching the `seo-config` resource
@@ -194,6 +211,7 @@ export const VERIFICATION_TOKEN_MAX = 200
  */
 export const SEO_CONFIG_FIELD_IDS = [
   'key',
+  'version',
   'siteName',
   'separator',
   'siteUrl',
@@ -374,13 +392,27 @@ function validateTables(
     errors.push({ field: 'tables', message: 'must be an object keyed by table slug' })
     return undefined
   }
+  const tableSlugs = Object.keys(input)
+  if (tableSlugs.length > CONFIG_TABLES_MAX) {
+    errors.push({
+      field: 'tables',
+      message: `must have at most ${CONFIG_TABLES_MAX} table entries`,
+    })
+  }
   const tables: Record<string, SeoTableConfig> = {}
-  for (const slug of Object.keys(input)) {
+  for (const slug of tableSlugs) {
     const field = `tables.${slug}`
     if (!TABLE_SLUG_RE.test(slug)) {
       errors.push({
         field,
         message: 'table slug must match [a-z0-9][a-z0-9_-]* (case-insensitive)',
+      })
+      continue
+    }
+    if (slug.length > TABLE_SLUG_MAX) {
+      errors.push({
+        field,
+        message: `table slug must be at most ${TABLE_SLUG_MAX} characters`,
       })
       continue
     }
@@ -406,10 +438,9 @@ function validateTables(
 }
 
 /**
- * Validate the `indexNow` section — the toggle only. `enabled: true` is
- * normalized away (absent = enabled — see `indexNowEnabled`), so storage
- * round-trips stay exact and the record disappears when nothing
- * meaningful is set. Server-owned fields (`key`, status) were moved to
+ * Validate the `indexNow` section — the toggle only. Preserve both boolean
+ * values so the serializer can write an explicit true in the versioned
+ * shape. Server-owned fields (`key`, status) were moved to
  * `seo-state` (review fix #9) and are rejected here as unknown.
  */
 function validateIndexNow(input: unknown, errors: FieldError[]): SeoIndexNowConfig | undefined {
@@ -428,17 +459,15 @@ function validateIndexNow(input: unknown, errors: FieldError[]): SeoIndexNowConf
   if (raw.enabled !== undefined) {
     if (typeof raw.enabled !== 'boolean') {
       errors.push({ field: 'indexNow.enabled', message: 'must be a boolean' })
-    } else if (raw.enabled === false) {
-      section.enabled = false
-    }
+    } else section.enabled = raw.enabled
   }
   return Object.keys(section).length > 0 ? section : undefined
 }
 
 /**
- * Validate the `schema` section (task 2.3). `enabled: true` is normalized
- * away (absent = enabled — see `schemaEnabled`), matching the indexNow
- * toggle discipline so storage round-trips stay exact. publisherLogoUrl
+ * Validate the `schema` section (task 2.3). Preserve both boolean values so
+ * versioned storage remains fail-closed when a section is partial.
+ * publisherLogoUrl
  * follows the SAME rules as per-entry ogImage (absolute http(s) URL or a
  * site-relative `/` path — `isUrlLike`); sameAs entries must be ABSOLUTE
  * http(s) URLs (a relative social-profile link is meaningless).
@@ -459,9 +488,7 @@ function validateSchema(input: unknown, errors: FieldError[]): SeoSchemaConfig |
   if (raw.enabled !== undefined) {
     if (typeof raw.enabled !== 'boolean') {
       errors.push({ field: 'schema.enabled', message: 'must be a boolean' })
-    } else if (raw.enabled === false) {
-      section.enabled = false
-    }
+    } else section.enabled = raw.enabled
   }
   if (raw.publisherKind !== undefined && raw.publisherKind !== '') {
     if (
@@ -610,8 +637,11 @@ function validateVerification(
       errors.push({ field: `verification.${field}`, message: 'must be a string' })
       continue
     }
-    if (value.length > 2000) {
-      errors.push({ field: `verification.${field}`, message: 'must be at most 2000 characters' })
+    if (value.length > URL_MAX) {
+      errors.push({
+        field: `verification.${field}`,
+        message: `must be at most ${URL_MAX} characters`,
+      })
       continue
     }
     const token = extractVerificationToken(value)
@@ -640,11 +670,18 @@ export function validateSeoConfig(input: unknown): SeoConfigValidation {
   const value: SeoConfigData = {}
 
   for (const key of Object.keys(input)) {
-    if (!(CONFIG_SECTION_KEYS as readonly string[]).includes(key)) {
+    if (key !== 'version' && !(CONFIG_SECTION_KEYS as readonly string[]).includes(key)) {
       errors.push({ field: key, message: 'unknown field' })
     }
   }
   const raw: Record<string, unknown> = { ...input }
+  if (raw.version !== undefined) {
+    if (raw.version !== SEO_CONFIG_VERSION) {
+      errors.push({ field: 'version', message: `must be ${SEO_CONFIG_VERSION}` })
+    } else {
+      value.version = SEO_CONFIG_VERSION
+    }
+  }
   if (raw.site !== undefined) {
     const site = validateSiteDefaults(raw.site, errors)
     if (site !== undefined) value.site = site
@@ -730,6 +767,12 @@ export function resolveConfigSections(
   existing: SeoConfigData,
 ): SeoConfigData {
   const resolved: SeoConfigData = {}
+  // `version` is document metadata, not a replaceable section. Carry the
+  // request's explicit marker when present; otherwise preserve the stored
+  // marker. A genuinely legacy document has neither, so it stays versionless
+  // here and serializeSeoConfig materializes its default-ON toggles once.
+  const version = validated.version ?? existing.version
+  if (version !== undefined) resolved.version = version
   for (const key of CONFIG_SECTION_KEYS) {
     const value =
       isPlainObject(rawBody) && key in rawBody ? validated[key] : existing[key]
@@ -748,9 +791,15 @@ export function resolveConfigSections(
  */
 export function serializeSeoConfig(config: SeoConfigData): Record<string, unknown>[] {
   const records: Record<string, unknown>[] = []
+  const version = SEO_CONFIG_VERSION
+  // A versionless document uses the original default-ON semantics for
+  // IndexNow and schema. Materialize those effective values while upgrading
+  // so the version marker cannot turn an absent toggle into false.
+  const hasConfigSections = CONFIG_SECTION_KEYS.some((key) => config[key] !== undefined)
+  const materializeLegacyDefaults = config.version === undefined && hasConfigSections
   const site = config.site
   if (site !== undefined) {
-    const data: Record<string, unknown> = { key: SITE_CONFIG_KEY }
+    const data: Record<string, unknown> = { key: SITE_CONFIG_KEY, version }
     if (site.siteName) data.siteName = site.siteName
     if (site.separator) data.separator = site.separator
     if (site.siteUrl) data.siteUrl = site.siteUrl
@@ -760,32 +809,41 @@ export function serializeSeoConfig(config: SeoConfigData): Record<string, unknow
   }
   for (const slug of Object.keys(config.tables ?? {})) {
     const table = config.tables![slug]!
-    const data: Record<string, unknown> = { key: `${TABLE_CONFIG_KEY_PREFIX}${slug}` }
+    const data: Record<string, unknown> = { key: `${TABLE_CONFIG_KEY_PREFIX}${slug}`, version }
     if (table.titleTemplate) data.titleTemplate = table.titleTemplate
     if (Object.keys(data).length > 1) records.push(data)
   }
-  // Only `enabled: false` is stored — absent means enabled (default ON).
-  if (config.indexNow?.enabled === false) {
-    records.push({ key: INDEXNOW_CONFIG_KEY, indexNowEnabled: false })
+  // Versioned records normally store only explicit toggle values. A legacy
+  // upgrade stores the effective default-ON value explicitly.
+  if (config.indexNow?.enabled !== undefined || materializeLegacyDefaults) {
+    records.push({
+      key: INDEXNOW_CONFIG_KEY,
+      version,
+      indexNowEnabled: materializeLegacyDefaults
+        ? indexNowEnabled(config)
+        : config.indexNow!.enabled,
+    })
   }
   const schema = config.schema
-  if (schema !== undefined) {
-    const data: Record<string, unknown> = { key: SCHEMA_CONFIG_KEY }
-    if (schema.enabled === false) data.schemaEnabled = false
-    if (schema.publisherKind) data.publisherKind = schema.publisherKind
-    if (schema.publisherName) data.publisherName = schema.publisherName
-    if (schema.publisherLogoUrl) data.publisherLogoUrl = schema.publisherLogoUrl
+  if (schema !== undefined || materializeLegacyDefaults) {
+    const data: Record<string, unknown> = { key: SCHEMA_CONFIG_KEY, version }
+    if (schema?.enabled !== undefined || materializeLegacyDefaults) {
+      data.schemaEnabled = materializeLegacyDefaults ? schemaEnabled(config) : schema!.enabled
+    }
+    if (schema?.publisherKind) data.publisherKind = schema.publisherKind
+    if (schema?.publisherName) data.publisherName = schema.publisherName
+    if (schema?.publisherLogoUrl) data.publisherLogoUrl = schema.publisherLogoUrl
     // Flat-scalar host constraint: the URL array rides as ONE JSON string.
-    if (schema.sameAs && schema.sameAs.length > 0) data.sameAsJson = JSON.stringify(schema.sameAs)
+    if (schema?.sameAs && schema.sameAs.length > 0) data.sameAsJson = JSON.stringify(schema.sameAs)
     if (Object.keys(data).length > 1) records.push(data)
   }
   // Analytics defaults OFF — only `enabled: true` is stored (task 2.4).
   if (config.analytics?.enabled === true) {
-    records.push({ key: ANALYTICS_CONFIG_KEY, analyticsEnabled: true })
+    records.push({ key: ANALYTICS_CONFIG_KEY, version, analyticsEnabled: true })
   }
   const verification = config.verification
   if (verification !== undefined) {
-    const data: Record<string, unknown> = { key: VERIFICATION_CONFIG_KEY }
+    const data: Record<string, unknown> = { key: VERIFICATION_CONFIG_KEY, version }
     if (verification.google) data.verificationGoogle = verification.google
     if (verification.bing) data.verificationBing = verification.bing
     if (verification.pinterest) data.verificationPinterest = verification.pinterest
@@ -801,6 +859,12 @@ export function serializeSeoConfig(config: SeoConfigData): Record<string, unknow
  */
 export function parseStoredSameAs(value: unknown): string[] | undefined {
   if (typeof value !== 'string' || value === '') return undefined
+  // Raw-length gate BEFORE JSON.parse (same posture as seoMeta's
+  // MAX_FOCUS_KEYWORDS_JSON_LENGTH): a hand-edited multi-megabyte record
+  // must not burn the eval budget before the per-item caps apply. Bound =
+  // SAME_AS_MAX items, each a fully \uXXXX-escaped URL_MAX string, plus
+  // JSON array/quote/comma overhead.
+  if (value.length > SAME_AS_JSON_MAX) return undefined
   let parsed: unknown
   try {
     parsed = JSON.parse(value)
@@ -811,10 +875,11 @@ export function parseStoredSameAs(value: unknown): string[] | undefined {
   const urls: string[] = []
   const seen = new Set<string>()
   for (const item of parsed) {
-    if (typeof item !== 'string' || item.length > URL_MAX || !isAbsoluteHttpUrl(item)) continue
-    if (seen.has(item)) continue
-    seen.add(item)
-    urls.push(item)
+    const normalized = typeof item === 'string' ? item.trim() : ''
+    if (normalized === '' || normalized.length > URL_MAX || !isAbsoluteHttpUrl(normalized)) continue
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    urls.push(normalized)
     if (urls.length >= SAME_AS_MAX) break
   }
   return urls.length > 0 ? urls : undefined
@@ -830,24 +895,29 @@ export function deserializeSeoConfigRecords(
 ): SeoConfigData {
   const config: SeoConfigData = {}
   const seen = new Set<string>()
+  let hasVersion = false
+  let invalidVersion = false
   for (const data of datas) {
+    if ('version' in data) {
+      if (data.version === SEO_CONFIG_VERSION) hasVersion = true
+      else invalidVersion = true
+    }
     const key = typeof data.key === 'string' ? data.key : ''
     if (key === '' || seen.has(key)) continue
     seen.add(key)
 
     if (key === SITE_CONFIG_KEY) {
       const site: SeoSiteDefaults = {}
-      if (typeof data.siteName === 'string' && data.siteName !== '') site.siteName = data.siteName
-      if (typeof data.separator === 'string' && data.separator !== '') {
-        site.separator = data.separator
-      }
-      if (typeof data.siteUrl === 'string' && data.siteUrl !== '') site.siteUrl = data.siteUrl
-      if (typeof data.titleTemplate === 'string' && data.titleTemplate !== '') {
-        site.titleTemplate = data.titleTemplate
-      }
-      if (typeof data.metaDescription === 'string' && data.metaDescription !== '') {
-        site.metaDescription = data.metaDescription
-      }
+      const storedSiteName = readStoredTrimmedString(data.siteName, SITE_NAME_MAX)
+      if (storedSiteName !== undefined) site.siteName = storedSiteName
+      const storedSeparator = readStoredTrimmedString(data.separator, SEPARATOR_MAX)
+      if (storedSeparator !== undefined) site.separator = storedSeparator
+      const storedSiteUrl = readStoredSiteUrl(data.siteUrl)
+      if (storedSiteUrl !== undefined) site.siteUrl = storedSiteUrl
+      const storedSiteTemplate = readStoredTitleTemplate(data.titleTemplate)
+      if (storedSiteTemplate !== undefined) site.titleTemplate = storedSiteTemplate
+      const storedDescription = readStoredTrimmedString(data.metaDescription, DESCRIPTION_MAX)
+      if (storedDescription !== undefined) site.metaDescription = storedDescription
       if (Object.keys(site).length > 0) config.site = site
       continue
     }
@@ -856,29 +926,25 @@ export function deserializeSeoConfigRecords(
       // Toggle only. Legacy embedded server state (indexNowKey/status
       // fields from pre-review builds) is IGNORED here — seoState.ts
       // lifts it into the seo-state collection on first read.
-      if (data.indexNowEnabled === false) config.indexNow = { enabled: false }
+      if (typeof data.indexNowEnabled === 'boolean') {
+        config.indexNow = { enabled: data.indexNowEnabled }
+      }
       continue
     }
 
     if (key === SCHEMA_CONFIG_KEY) {
       const schema: SeoSchemaConfig = {}
-      if (data.schemaEnabled === false) schema.enabled = false
+      if (typeof data.schemaEnabled === 'boolean') schema.enabled = data.schemaEnabled
       if (
         typeof data.publisherKind === 'string' &&
         (PUBLISHER_KINDS as readonly string[]).includes(data.publisherKind)
       ) {
         schema.publisherKind = data.publisherKind as 'organization' | 'person'
       }
-      if (typeof data.publisherName === 'string' && data.publisherName !== '') {
-        schema.publisherName = data.publisherName
-      }
-      if (
-        typeof data.publisherLogoUrl === 'string' &&
-        data.publisherLogoUrl !== '' &&
-        isUrlLike(data.publisherLogoUrl)
-      ) {
-        schema.publisherLogoUrl = data.publisherLogoUrl
-      }
+      const publisherName = readStoredTrimmedString(data.publisherName, PUBLISHER_NAME_MAX)
+      if (publisherName !== undefined) schema.publisherName = publisherName
+      const publisherLogoUrl = readStoredUrlLike(data.publisherLogoUrl)
+      if (publisherLogoUrl !== undefined) schema.publisherLogoUrl = publisherLogoUrl
       const sameAs = parseStoredSameAs(data.sameAsJson)
       if (sameAs !== undefined) schema.sameAs = sameAs
       if (Object.keys(schema).length > 0) config.schema = schema
@@ -915,16 +981,41 @@ export function deserializeSeoConfigRecords(
       const slug = key.slice(TABLE_CONFIG_KEY_PREFIX.length)
       if (!TABLE_SLUG_RE.test(slug)) continue
       const table: SeoTableConfig = {}
-      if (typeof data.titleTemplate === 'string' && data.titleTemplate !== '') {
-        table.titleTemplate = data.titleTemplate
-      }
+      const titleTemplate = readStoredTitleTemplate(data.titleTemplate)
+      if (titleTemplate !== undefined) table.titleTemplate = titleTemplate
       if (Object.keys(table).length > 0) {
         config.tables = config.tables ?? {}
         config.tables[slug] = table
       }
     }
   }
+  if (invalidVersion) config.version = 0
+  else if (hasVersion) config.version = SEO_CONFIG_VERSION
   return config
+}
+
+function readStoredTrimmedString(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string' || value === '') return undefined
+  const errors: FieldError[] = []
+  return checkTrimmedString(errors, 'stored', value, max)
+}
+
+function readStoredTitleTemplate(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value === '') return undefined
+  const errors: FieldError[] = []
+  return checkTitleTemplate(errors, 'stored', value)
+}
+
+function readStoredSiteUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value === '') return undefined
+  const errors: FieldError[] = []
+  if (!checkBoundedString(errors, 'stored', value, URL_MAX)) return undefined
+  return normalizeSiteOrigin(value.trim())
+}
+
+function readStoredUrlLike(value: unknown): string | undefined {
+  const trimmed = readStoredTrimmedString(value, URL_MAX)
+  return trimmed !== undefined && isUrlLike(trimmed) ? trimmed : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1047,84 @@ export const SEO_CONFIG_CACHE_TTL_MS = 5_000
  * possibly-partial view.
  */
 export const HOST_LIST_LIMIT = 1000
+
+/**
+ * Leave one possible record for each non-table config section so a validated
+ * document can still fit under the host's complete-list cap.
+ */
+export const CONFIG_TABLES_MAX = HOST_LIST_LIMIT - (CONFIG_SECTION_KEYS.length - 1)
+
+const JSON_STRING_MAX_ESCAPED_LENGTH = 6
+
+function maxJsonStringLength(maxCharacters: number): number {
+  return 2 + maxCharacters * JSON_STRING_MAX_ESCAPED_LENGTH
+}
+
+function maxJsonPropertyLength(key: string, valueLength: number): number {
+  return key.length + 3 + valueLength
+}
+
+function maxJsonObjectLength(properties: readonly number[]): number {
+  return 2 + properties.reduce((total, propertyLength) => total + propertyLength + 1, 0)
+}
+
+function maxJsonArrayLength(itemLength: number, itemCount: number): number {
+  return 2 + itemCount * (itemLength + 1)
+}
+
+const MAX_JSON_BOOLEAN_LENGTH = 'false'.length
+const MAX_SITE_CONFIG_JSON_LENGTH = maxJsonObjectLength([
+  maxJsonPropertyLength('siteName', maxJsonStringLength(SITE_NAME_MAX)),
+  maxJsonPropertyLength('separator', maxJsonStringLength(SEPARATOR_MAX)),
+  maxJsonPropertyLength('siteUrl', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength('titleTemplate', maxJsonStringLength(TITLE_TEMPLATE_MAX)),
+  maxJsonPropertyLength('metaDescription', maxJsonStringLength(DESCRIPTION_MAX)),
+])
+const MAX_TABLE_CONFIG_JSON_LENGTH = maxJsonObjectLength([
+  maxJsonPropertyLength('titleTemplate', maxJsonStringLength(TITLE_TEMPLATE_MAX)),
+])
+const MAX_TABLES_CONFIG_JSON_LENGTH = maxJsonObjectLength(
+  Array.from({ length: CONFIG_TABLES_MAX }, () =>
+    maxJsonPropertyLength('x'.repeat(TABLE_SLUG_MAX), MAX_TABLE_CONFIG_JSON_LENGTH),
+  ),
+)
+const MAX_SCHEMA_CONFIG_JSON_LENGTH = maxJsonObjectLength([
+  maxJsonPropertyLength('enabled', MAX_JSON_BOOLEAN_LENGTH),
+  maxJsonPropertyLength('publisherKind', maxJsonStringLength(Math.max(...PUBLISHER_KINDS.map((value) => value.length)))),
+  maxJsonPropertyLength('publisherName', maxJsonStringLength(PUBLISHER_NAME_MAX)),
+  maxJsonPropertyLength('publisherLogoUrl', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength(
+    'sameAs',
+    maxJsonArrayLength(maxJsonStringLength(URL_MAX), SAME_AS_MAX),
+  ),
+])
+const MAX_VERIFICATION_CONFIG_JSON_LENGTH = maxJsonObjectLength([
+  maxJsonPropertyLength('google', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength('bing', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength('pinterest', maxJsonStringLength(URL_MAX)),
+])
+
+/**
+ * Raw JSON character budget for POST /config. The bound follows every
+ * validator cap, the host's complete-list table budget, JSON field names and
+ * worst-case string escaping; it is unrelated to the anonymous beacon cap.
+ */
+export const SEO_CONFIG_REQUEST_BODY_MAX = maxJsonObjectLength([
+  maxJsonPropertyLength('site', MAX_SITE_CONFIG_JSON_LENGTH),
+  maxJsonPropertyLength('tables', MAX_TABLES_CONFIG_JSON_LENGTH),
+  maxJsonPropertyLength('indexNow', maxJsonObjectLength([
+    maxJsonPropertyLength('enabled', MAX_JSON_BOOLEAN_LENGTH),
+  ])),
+  maxJsonPropertyLength('schema', MAX_SCHEMA_CONFIG_JSON_LENGTH),
+  maxJsonPropertyLength('analytics', maxJsonObjectLength([
+    maxJsonPropertyLength('enabled', MAX_JSON_BOOLEAN_LENGTH),
+  ])),
+  maxJsonPropertyLength('verification', MAX_VERIFICATION_CONFIG_JSON_LENGTH),
+])
+
+export function isSeoConfigRequestBodyWithinLimit(raw: string): boolean {
+  return raw.length <= SEO_CONFIG_REQUEST_BODY_MAX
+}
 
 /** Per-request cap on duplicate-cleanup deletions (publish-path safety). */
 export const MAX_CLEANUP_DELETES = 25

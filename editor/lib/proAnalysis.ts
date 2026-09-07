@@ -5,7 +5,7 @@
  * (editor/lib/__tests__/proAnalysis.test.ts).
  *
  * LICENSE STATE: the panel fetches GET /license on the plugin's
- * authenticated runtime routes (the Connections tab's gating pattern).
+ * authenticated runtime routes (the gated admin tab's pattern).
  * `proUnlockedFromResponse` collapses every failure mode to LOCKED: a
  * non-OK response (the FREE build has no /license route at all — 404), a
  * malformed body, or `unlocked !== true`. The free build ships this SAME

@@ -42,15 +42,16 @@
  */
 
 import type { SeoHeadPayload } from './lib/headSurgeon'
-import { applySeoHead, escapeAttr } from './lib/headSurgeon'
+import { applySeoHead, escapeAttr, findCommentEnd, findHeadClose } from './lib/headSurgeon'
 import { pageUrl, slugBreadcrumbs } from './lib/pageUrl'
 import { buildSchemaGraph } from './lib/schemaGraph'
 import { renderTemplate } from './lib/templateEngine'
 import type { SeoMetaPayload } from './seoMeta'
 // Type-only: a VALUE import from seoConfig would create an import cycle
 // (seoConfig imports normalizeSiteOrigin/TITLE_TEMPLATE_VARS from here).
-// The schema-enabled default is therefore checked inline below (absent =
-// enabled — mirrors seoConfig.schemaEnabled).
+// The schema-enabled default is therefore checked inline below. Configs
+// without a version retain the original default-on shape; versioned configs
+// require an explicit true toggle.
 import type { SeoConfigData } from './seoConfig'
 
 // ---------------------------------------------------------------------------
@@ -228,6 +229,31 @@ function findTitleRawClose(lower: string, name: string, from: number): number {
 const TITLE_MASKED = ['script', 'style', 'noscript']
 
 /**
+ * Hard cap on the extracted `<title>` text, in Unicode code points.
+ *
+ * The document title is the one input to the head pipeline the plugin does not
+ * bound anywhere else: it feeds `%title%`, the `<!--seo:source-title:…-->`
+ * stash, the schema graph's page name and the captured audit facts. Matches
+ * `RENDERED_TEMPLATE_MAX` so a title and a rendered template clamp alike; both
+ * are far past any usable SERP title.
+ */
+export const TITLE_TEXT_MAX = 512
+
+/** Truncate to `max` CODE POINTS (never splits a surrogate pair). */
+function clampCodePoints(text: string, max: number): string {
+  // UTF-16 length >= code-point count, so this fast path can never truncate.
+  if (text.length <= max) return text
+  let out = ''
+  let count = 0
+  for (const ch of text) {
+    if (count === max) break
+    out += ch
+    count += 1
+  }
+  return out
+}
+
+/**
  * Extract the text of the document's first real `<title>` in the head as
  * plain (entity-decoded, whitespace-collapsed) text. The scan is
  * MASK-AWARE (headSurgeon's masking discipline): comment content and
@@ -235,21 +261,20 @@ const TITLE_MASKED = ['script', 'style', 'noscript']
  * commented-out decoy title nor a `<title>` string inside a script (e.g.
  * `<script>const x="<title>evil</title>"</script>`) can ever win.
  * Returns undefined when there is no head, no title, or the title is
- * empty. This feeds `%title%` only — head REWRITING stays with the far
- * stricter headSurgeon.
+ * empty, and clamps the result to TITLE_TEXT_MAX code points. This feeds
+ * `%title%` only — head REWRITING stays with the far stricter headSurgeon.
  */
 export function extractTitleText(html: string): string | undefined {
-  const headClose = /<\/head\s*>/i.exec(html)
-  if (!headClose) return undefined
-  const head = html.slice(0, headClose.index)
+  const headClose = findHeadClose(html)
+  if (headClose === -1) return undefined
+  const head = html.slice(0, headClose)
   const lower = head.toLowerCase()
   let i = 0
   while (i < head.length) {
     const lt = head.indexOf('<', i)
     if (lt === -1) break
     if (head.startsWith('<!--', lt)) {
-      const end = head.indexOf('-->', lt + 4)
-      i = end === -1 ? head.length : end + 3
+      i = findCommentEnd(head, lt)
       continue
     }
     let masked = false
@@ -268,7 +293,7 @@ export function extractTitleText(html: string): string | undefined {
       const closeAt = findTitleRawClose(lower, 'title', openEnd)
       if (closeAt === -1) return undefined
       const text = decodeEntities(head.slice(openEnd, closeAt)).replace(/\s+/g, ' ').trim()
-      return text === '' ? undefined : text
+      return text === '' ? undefined : clampCodePoints(text, TITLE_TEXT_MAX)
     }
     i = findTitleTagEnd(head, lt)
   }
@@ -288,19 +313,94 @@ function normalizeTitle(text: string): string {
 }
 
 /**
+ * [start, end) ranges of head content that is OPAQUE to the marker scan:
+ * ordinary HTML comments and the full extent of script/style/noscript
+ * elements. The marker comments themselves are never masked — they are the
+ * plugin's own delimiters. Mirrors headSurgeon's `computeMasks` discipline
+ * with metaBlock's existing tag helpers; single forward pass, linear.
+ */
+function computeMarkerMasks(head: string): Array<[number, number]> {
+  const masks: Array<[number, number]> = []
+  const lower = head.toLowerCase()
+  let i = 0
+  while (i < head.length) {
+    const lt = head.indexOf('<', i)
+    if (lt === -1) break
+    if (head.startsWith('<!--', lt)) {
+      if (head.startsWith(SEO_BLOCK_START, lt)) {
+        i = lt + SEO_BLOCK_START.length
+        continue
+      }
+      if (head.startsWith(SEO_BLOCK_END, lt)) {
+        i = lt + SEO_BLOCK_END.length
+        continue
+      }
+      const end = findCommentEnd(head, lt)
+      masks.push([lt, end])
+      i = end
+      continue
+    }
+    let masked = false
+    for (const name of TITLE_MASKED) {
+      if (!lower.startsWith('<' + name, lt)) continue
+      if (!isTitleTagBoundary(lower[lt + name.length + 1])) continue
+      const openEnd = findTitleTagEnd(head, lt)
+      const closeAt = findTitleRawClose(lower, name, openEnd)
+      const end = closeAt === -1 ? head.length : findTitleTagEnd(head, closeAt)
+      masks.push([lt, end])
+      i = end
+      masked = true
+      break
+    }
+    if (masked) continue
+    i = findTitleTagEnd(head, lt)
+  }
+  return masks
+}
+
+/** indexOf that skips occurrences overlapping a masked (opaque) range. */
+function indexOfUnmasked(
+  s: string,
+  needle: string,
+  from: number,
+  masks: Array<[number, number]>,
+): number {
+  let i = s.indexOf(needle, from)
+  while (i !== -1) {
+    let hidden = false
+    for (const m of masks) {
+      if (i < m[1] && m[0] < i + needle.length) {
+        hidden = true
+        break
+      }
+    }
+    if (!hidden) return i
+    i = s.indexOf(needle, i + 1)
+  }
+  return -1
+}
+
+/**
  * [start, end) of the first properly PAIRED `<!--seo:start-->…
  * <!--seo:end-->` block in `s` — same pairing rule as headSurgeon's
  * remover (a start marker pairs with the next end marker only when no
  * other start marker sits between them). Returns null when none.
+ *
+ * MASK-AWARE, exactly like `removeSeoBlocks`: markers that only appear as
+ * text inside a comment or a script/style/noscript body are not markers.
+ * Without that, a head `<script>` holding a literal marker pair earlier in
+ * the document would win over the plugin's real (trailing) block and its
+ * forged `<!--seo:source-title:…-->` would poison `%title%`.
  */
 function findPairedSeoBlock(s: string): [number, number] | null {
+  const masks = computeMarkerMasks(s)
   let pos = 0
   while (true) {
-    const start = s.indexOf(SEO_BLOCK_START, pos)
+    const start = indexOfUnmasked(s, SEO_BLOCK_START, pos, masks)
     if (start === -1) return null
-    const end = s.indexOf(SEO_BLOCK_END, start + SEO_BLOCK_START.length)
+    const end = indexOfUnmasked(s, SEO_BLOCK_END, start + SEO_BLOCK_START.length, masks)
     if (end === -1) return null
-    const nextStart = s.indexOf(SEO_BLOCK_START, start + SEO_BLOCK_START.length)
+    const nextStart = indexOfUnmasked(s, SEO_BLOCK_START, start + SEO_BLOCK_START.length, masks)
     if (nextStart !== -1 && nextStart < end) {
       pos = nextStart // orphan start — keep scanning
       continue
@@ -340,9 +440,9 @@ function readStashComment(s: string, open: string): string | undefined {
  */
 export function resolveSourceTitle(html: string): string | undefined {
   const currentTitle = extractTitleText(html)
-  const headClose = /<\/head\s*>/i.exec(html)
-  if (!headClose) return currentTitle
-  const head = html.slice(0, headClose.index)
+  const headClose = findHeadClose(html)
+  if (headClose === -1) return currentTitle
+  const head = html.slice(0, headClose)
 
   const block = findPairedSeoBlock(head)
   if (!block) return currentTitle
@@ -587,7 +687,11 @@ export function buildSchemaTag(
   documentTitle: string | undefined,
 ): string | undefined {
   if (ctx.schemaPage === undefined) return undefined
-  if (config.schema?.enabled === false) return undefined
+  const schemaEnabled =
+    config.version === undefined
+      ? config.schema?.enabled !== false
+      : config.version === 1 && config.schema?.enabled === true
+  if (!schemaEnabled) return undefined
   const origin = normalizeSiteOrigin(config.site?.siteUrl)
   if (origin === undefined) return undefined
 

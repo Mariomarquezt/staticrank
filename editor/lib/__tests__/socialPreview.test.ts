@@ -99,6 +99,34 @@ describe('resolveSocialCard', () => {
     expect(card.imageUrl).toBeNull()
   })
 
+  // ── stored twitter:card decides the X layout (round-5 t4-39) ──────────
+
+  test('no stored twitterCard keeps the large X card (publish emits no tag)', () => {
+    expect(resolveSocialCard(input()).xCard).toBe('summary_large_image')
+  })
+
+  test('stored twitterCard: summary previews the SMALL X card', () => {
+    expect(resolveSocialCard(input({ twitterCard: 'summary' })).xCard).toBe('summary')
+  })
+
+  test('stored twitterCard: summary_large_image previews the large X card', () => {
+    expect(resolveSocialCard(input({ twitterCard: 'summary_large_image' })).xCard).toBe(
+      'summary_large_image',
+    )
+  })
+
+  test('twitterCard never leaks into the Facebook card or the text values', () => {
+    const large = resolveSocialCard(input({ ogImage: 'https://cdn.example.com/a.png' }))
+    const small = resolveSocialCard(
+      input({ ogImage: 'https://cdn.example.com/a.png', twitterCard: 'summary' }),
+    )
+    expect(small.fbTitle).toBe(large.fbTitle)
+    expect(small.fbDescription).toBe(large.fbDescription)
+    expect(small.xTitle).toBe(large.xTitle)
+    expect(small.xDescription).toBe(large.xDescription)
+    expect(small.imageUrl).toBe(large.imageUrl)
+  })
+
   test('og overrides take precedence over resolved values', () => {
     const card = resolveSocialCard(
       input({ ogTitle: 'OG Title', ogDescription: 'OG description.' }),

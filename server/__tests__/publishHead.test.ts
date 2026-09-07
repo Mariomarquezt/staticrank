@@ -105,6 +105,17 @@ describe('publish.html pipeline composition', () => {
     expect(twice.match(/<!--seo:start-->/g)?.length).toBe(1)
   })
 
+  test('a head containing `<!-->` before the title round-trips and still resolves %title% (G1)', () => {
+    for (const abrupt of ['<!-->', '<!--->']) {
+      const html = PAGE_HTML.replace('<title>', `${abrupt}<title>`)
+      const once = runFilter(html, ENTRY, CONFIG, CTX)
+      expect(once).toContain('<title>About Us &amp; Team | Acme Widgets</title>')
+      const twice = runFilter(once, ENTRY, CONFIG, CTX)
+      expect(twice).toBe(once)
+      expect(twice.match(/<!--seo:start-->/g)?.length).toBe(1)
+    }
+  })
+
   test('re-apply after a template change re-renders from the ORIGINAL title', () => {
     const once = runFilter(PAGE_HTML, ENTRY, CONFIG, CTX)
     // The templated title has replaced <title>; the stash comment keeps the

@@ -88,11 +88,28 @@ export type SeoMetaValidation =
 /** Manifest resource id — must match instatic-plugin.config.ts. */
 export const SEO_META_RESOURCE_ID = 'seo-meta'
 
+/** Per-invocation cap on orphan/duplicate record deletions. */
+export const SEO_META_CLEANUP_CAP = 25
+
+/** Physical seo-meta records inspected per maintenance tick. */
+export const SEO_META_RECONCILE_BATCH_SIZE = 50
+
+/** seo-state key for the persisted seo-meta reconcile offset. */
+export const SEO_META_RECONCILE_STATE_KEY = 'meta-reconcile'
+
 export const TITLE_MAX = 300
 export const DESCRIPTION_MAX = 500
 export const URL_MAX = 2000
 
 const TWITTER_CARD_VALUES: readonly TwitterCard[] = ['summary', 'summary_large_image']
+
+const SCHEMA_TYPE_VALUES: readonly SchemaPageType[] = [
+  'WebPage',
+  'AboutPage',
+  'ContactPage',
+  'CollectionPage',
+  'SearchResultsPage',
+]
 
 export const FOCUS_KEYWORD_MAX = 80
 export const FOCUS_KEYWORDS_MAX = 10
@@ -103,6 +120,73 @@ export const FOCUS_KEYWORDS_MAX = 10
  * but declared LOCALLY: this free module must not import server/schema/**.
  */
 export const CUSTOM_SCHEMA_JSON_MAX = 20_000
+
+/** Numeric mirror of schema/store.RAW_JSON_MAX_DEPTH. Kept local because
+ * this free module must not import server/schema/**. */
+export const CUSTOM_SCHEMA_JSON_MAX_DEPTH = 32
+
+/** A JSON string can expand a UTF-16 code unit to at most `\\u0000`. */
+const JSON_STRING_MAX_ESCAPED_LENGTH = 6
+
+function maxJsonStringLength(maxCharacters: number): number {
+  return 2 + maxCharacters * JSON_STRING_MAX_ESCAPED_LENGTH
+}
+
+function maxJsonPropertyLength(key: string, valueLength: number): number {
+  return key.length + 3 + valueLength
+}
+
+function maxJsonObjectLength(properties: readonly number[]): number {
+  return 2 + properties.reduce((total, propertyLength) => total + propertyLength + 1, 0)
+}
+
+function maxJsonArrayLength(itemLength: number, itemCount: number): number {
+  return 2 + itemCount * (itemLength + 1)
+}
+
+const MAX_JSON_BOOLEAN_LENGTH = 'false'.length
+const MAX_ROBOTS_JSON_LENGTH = maxJsonObjectLength([
+  maxJsonPropertyLength('noindex', MAX_JSON_BOOLEAN_LENGTH),
+  maxJsonPropertyLength('nofollow', MAX_JSON_BOOLEAN_LENGTH),
+])
+/**
+ * Worst-case length of the ONE JSON string `serializeSeoMeta` writes for
+ * `focusKeywords` (FOCUS_KEYWORDS_MAX items × FOCUS_KEYWORD_MAX chars,
+ * each fully `\uXXXX`-escaped). Exported because the READ side gates on
+ * it too: `parseStoredFocusKeywords` refuses to parse anything longer,
+ * so a hand-edited multi-megabyte record cannot burn the publish
+ * deadline before the per-item caps get a chance to apply.
+ */
+export const MAX_FOCUS_KEYWORDS_JSON_LENGTH = maxJsonArrayLength(
+  maxJsonStringLength(FOCUS_KEYWORD_MAX),
+  FOCUS_KEYWORDS_MAX,
+)
+const MAX_TWITTER_CARD_LENGTH = Math.max(...TWITTER_CARD_VALUES.map((value) => value.length))
+const MAX_SCHEMA_TYPE_LENGTH = Math.max(...SCHEMA_TYPE_VALUES.map((value) => value.length))
+
+/**
+ * Raw JSON character budget for POST /meta. This is a conservative upper
+ * bound over every validator cap, including JSON field names, envelopes and
+ * worst-case string escaping; it is deliberately independent of the beacon
+ * payload budget in trackerPayload.ts.
+ */
+export const SEO_META_REQUEST_BODY_MAX = maxJsonObjectLength([
+  maxJsonPropertyLength('title', maxJsonStringLength(TITLE_MAX)),
+  maxJsonPropertyLength('metaDescription', maxJsonStringLength(DESCRIPTION_MAX)),
+  maxJsonPropertyLength('canonical', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength('robots', MAX_ROBOTS_JSON_LENGTH),
+  maxJsonPropertyLength('ogTitle', maxJsonStringLength(TITLE_MAX)),
+  maxJsonPropertyLength('ogDescription', maxJsonStringLength(DESCRIPTION_MAX)),
+  maxJsonPropertyLength('ogImage', maxJsonStringLength(URL_MAX)),
+  maxJsonPropertyLength('twitterCard', maxJsonStringLength(MAX_TWITTER_CARD_LENGTH)),
+  maxJsonPropertyLength('focusKeywords', MAX_FOCUS_KEYWORDS_JSON_LENGTH),
+  maxJsonPropertyLength('schemaType', maxJsonStringLength(MAX_SCHEMA_TYPE_LENGTH)),
+  maxJsonPropertyLength('customSchemaJson', maxJsonStringLength(CUSTOM_SCHEMA_JSON_MAX)),
+])
+
+export function isSeoMetaRequestBodyWithinLimit(raw: string): boolean {
+  return raw.length <= SEO_META_REQUEST_BODY_MAX
+}
 
 /**
  * CROSS-AGENT CONTRACT (task 2.3, review round 2 #4) — focus-keyword
@@ -126,14 +210,6 @@ export function focusKeywordKey(keyword: string): string {
     typeof trimmed.normalize === 'function' ? trimmed.normalize('NFC') : trimmed
   return normalized.toLowerCase()
 }
-
-const SCHEMA_TYPE_VALUES: readonly SchemaPageType[] = [
-  'WebPage',
-  'AboutPage',
-  'ContactPage',
-  'CollectionPage',
-  'SearchResultsPage',
-]
 
 /**
  * Flat record-data field ids, matching the `seo-meta` resource declaration
@@ -220,6 +296,40 @@ function checkBoundedString(
   return true
 }
 
+/**
+ * Bounded string that is TRIMMED before storage — parity with seoConfig's
+ * `checkTrimmedString` (round 5 triage C#5). The host trims every text
+ * field on write (`data[field.id] = value.trim()` — vendor/Instatic
+ * src/core/plugins/resourceRecords.ts:61), so an untrimmed validated
+ * value would diverge from what actually stores, and a whitespace-only
+ * value would store as `''` and silently vanish from the document the
+ * save appeared to accept. Validation therefore normalizes to the trimmed
+ * value and rejects values that trim to nothing.
+ *
+ * `''` is NOT an error here (unlike seoConfig, where '' is absent
+ * upstream): POST /meta is a FULL REPLACE and an empty string is its
+ * documented clear-by-empty form — `serializeSeoMeta` drops it, so
+ * passing it through keeps those round-trips exact.
+ *
+ * Returns the string to store, or undefined when an error was recorded.
+ */
+function checkTrimmedString(
+  errors: FieldError[],
+  field: string,
+  value: unknown,
+  max: number,
+): string | undefined {
+  if (!checkBoundedString(errors, field, value, max)) return undefined
+  const raw = value as string
+  if (raw === '') return ''
+  const trimmed = raw.trim()
+  if (trimmed === '') {
+    errors.push({ field, message: 'must contain a non-whitespace character' })
+    return undefined
+  }
+  return trimmed
+}
+
 function checkUrlField(errors: FieldError[], field: string, value: unknown): value is string {
   if (!checkBoundedString(errors, field, value, URL_MAX)) return false
   if (!isUrlLike(value as string)) {
@@ -261,14 +371,18 @@ export function validateSeoMeta(input: unknown): SeoMetaValidation {
   // check: a polluted Object.prototype must never leak into the payload).
   const raw: Record<string, unknown> = { ...input }
 
-  if (raw.title !== undefined && checkBoundedString(errors, 'title', raw.title, TITLE_MAX)) {
-    value.title = raw.title as string
+  if (raw.title !== undefined) {
+    const title = checkTrimmedString(errors, 'title', raw.title, TITLE_MAX)
+    if (title !== undefined) value.title = title
   }
-  if (
-    raw.metaDescription !== undefined &&
-    checkBoundedString(errors, 'metaDescription', raw.metaDescription, DESCRIPTION_MAX)
-  ) {
-    value.metaDescription = raw.metaDescription as string
+  if (raw.metaDescription !== undefined) {
+    const metaDescription = checkTrimmedString(
+      errors,
+      'metaDescription',
+      raw.metaDescription,
+      DESCRIPTION_MAX,
+    )
+    if (metaDescription !== undefined) value.metaDescription = metaDescription
   }
   if (raw.canonical !== undefined && checkUrlField(errors, 'canonical', raw.canonical)) {
     value.canonical = raw.canonical as string
@@ -297,14 +411,18 @@ export function validateSeoMeta(input: unknown): SeoMetaValidation {
     }
   }
 
-  if (raw.ogTitle !== undefined && checkBoundedString(errors, 'ogTitle', raw.ogTitle, TITLE_MAX)) {
-    value.ogTitle = raw.ogTitle as string
+  if (raw.ogTitle !== undefined) {
+    const ogTitle = checkTrimmedString(errors, 'ogTitle', raw.ogTitle, TITLE_MAX)
+    if (ogTitle !== undefined) value.ogTitle = ogTitle
   }
-  if (
-    raw.ogDescription !== undefined &&
-    checkBoundedString(errors, 'ogDescription', raw.ogDescription, DESCRIPTION_MAX)
-  ) {
-    value.ogDescription = raw.ogDescription as string
+  if (raw.ogDescription !== undefined) {
+    const ogDescription = checkTrimmedString(
+      errors,
+      'ogDescription',
+      raw.ogDescription,
+      DESCRIPTION_MAX,
+    )
+    if (ogDescription !== undefined) value.ogDescription = ogDescription
   }
   if (raw.ogImage !== undefined && checkUrlField(errors, 'ogImage', raw.ogImage)) {
     value.ogImage = raw.ogImage as string
@@ -422,10 +540,38 @@ export function customSchemaJsonProblem(value: string): string | undefined {
   }
   if (!isPlainObject(parsed)) return 'must be a JSON object'
   const type = parsed['@type']
-  if (typeof type !== 'string' || type === '') {
+  if (typeof type !== 'string' || type.trim() === '') {
     return 'must carry a non-empty string "@type"'
   }
+  if (exceedsCustomSchemaJsonDepth(parsed, CUSTOM_SCHEMA_JSON_MAX_DEPTH)) {
+    return `must nest at most ${CUSTOM_SCHEMA_JSON_MAX_DEPTH} levels deep`
+  }
   return undefined
+}
+
+/** Iterative depth probe matching schema/store.exceedsJsonDepth. Recursion
+ * would risk the same QuickJS stack overflow this guard prevents. */
+function exceedsCustomSchemaJsonDepth(value: unknown, max: number): boolean {
+  const stack: { value: unknown; depth: number }[] = [{ value, depth: 1 }]
+  while (stack.length > 0) {
+    const item = stack.pop()!
+    const current = item.value
+    const isArray = Array.isArray(current)
+    const isObject = !isArray && current !== null && typeof current === 'object'
+    if (!isArray && !isObject) continue
+    if (item.depth > max) return true
+    if (isArray) {
+      for (const child of current as unknown[]) {
+        stack.push({ value: child, depth: item.depth + 1 })
+      }
+    } else {
+      const record = current as Record<string, unknown>
+      for (const key of Object.keys(record)) {
+        stack.push({ value: record[key], depth: item.depth + 1 })
+      }
+    }
+  }
+  return false
 }
 
 const SEO_META_PAYLOAD_KEYS = [
@@ -484,9 +630,16 @@ export function serializeSeoMeta(key: string, meta: SeoMetaPayload): Record<stri
  * first occurrence's original kept, order preserved), capped at
  * FOCUS_KEYWORDS_MAX. Anything else in a hand-edited or stale record is
  * silently dropped (never a throw).
+ *
+ * The RAW length is gated BEFORE `JSON.parse` (round 5 triage C#4): the
+ * per-item caps below only bound the parse RESULT, so an oversized
+ * hand-edited record — the only way one can exist, POST /meta is
+ * size-gated at the route — would otherwise be parsed in full on the
+ * publish hot path and the page would ship undecorated.
  */
 export function parseStoredFocusKeywords(value: unknown): string[] | undefined {
   if (typeof value !== 'string' || value === '') return undefined
+  if (value.length > MAX_FOCUS_KEYWORDS_JSON_LENGTH) return undefined
   let parsed: unknown
   try {
     parsed = JSON.parse(value)
@@ -509,53 +662,54 @@ export function parseStoredFocusKeywords(value: unknown): string[] | undefined {
   return keywords.length > 0 ? keywords : undefined
 }
 
+/** Validate one read-back field with the same validator used by writes. */
+function readValidatedField(field: string, value: unknown): unknown {
+  const validated = validateSeoMeta({ [field]: value })
+  if (!validated.ok) return undefined
+  return (validated.value as Record<string, unknown>)[field]
+}
+
 /**
  * Flat record data → payload. Defensive: only well-typed fields survive, so
  * a hand-edited or stale record can never produce a malformed payload.
  */
 export function deserializeSeoMeta(data: Record<string, unknown>): SeoMetaPayload {
   const meta: SeoMetaPayload = {}
-  if (typeof data.title === 'string' && data.title !== '') meta.title = data.title
-  if (typeof data.metaDescription === 'string' && data.metaDescription !== '') {
-    meta.metaDescription = data.metaDescription
+  const title = readValidatedField('title', data.title)
+  if (typeof title === 'string' && title !== '') meta.title = title
+  const metaDescription = readValidatedField('metaDescription', data.metaDescription)
+  if (typeof metaDescription === 'string' && metaDescription !== '') {
+    meta.metaDescription = metaDescription
   }
-  if (typeof data.canonical === 'string' && data.canonical !== '') meta.canonical = data.canonical
+  const canonical = readValidatedField('canonical', data.canonical)
+  if (typeof canonical === 'string' && canonical !== '') meta.canonical = canonical
 
   const robots: SeoRobots = {}
   if (typeof data.robotsNoindex === 'boolean') robots.noindex = data.robotsNoindex
   if (typeof data.robotsNofollow === 'boolean') robots.nofollow = data.robotsNofollow
   if (Object.keys(robots).length > 0) meta.robots = robots
 
-  if (typeof data.ogTitle === 'string' && data.ogTitle !== '') meta.ogTitle = data.ogTitle
-  if (typeof data.ogDescription === 'string' && data.ogDescription !== '') {
-    meta.ogDescription = data.ogDescription
+  const ogTitle = readValidatedField('ogTitle', data.ogTitle)
+  if (typeof ogTitle === 'string' && ogTitle !== '') meta.ogTitle = ogTitle
+  const ogDescription = readValidatedField('ogDescription', data.ogDescription)
+  if (typeof ogDescription === 'string' && ogDescription !== '') {
+    meta.ogDescription = ogDescription
   }
-  if (typeof data.ogImage === 'string' && data.ogImage !== '') meta.ogImage = data.ogImage
-  if (
-    typeof data.twitterCard === 'string' &&
-    (TWITTER_CARD_VALUES as readonly string[]).includes(data.twitterCard)
-  ) {
-    meta.twitterCard = data.twitterCard as TwitterCard
-  }
+  const ogImage = readValidatedField('ogImage', data.ogImage)
+  if (typeof ogImage === 'string' && ogImage !== '') meta.ogImage = ogImage
+  const twitterCard = readValidatedField('twitterCard', data.twitterCard)
+  if (typeof twitterCard === 'string') meta.twitterCard = twitterCard as TwitterCard
   const focusKeywords = parseStoredFocusKeywords(data.focusKeywords)
-  if (focusKeywords !== undefined) meta.focusKeywords = focusKeywords
-  if (
-    typeof data.schemaType === 'string' &&
-    (SCHEMA_TYPE_VALUES as readonly string[]).includes(data.schemaType)
-  ) {
-    meta.schemaType = data.schemaType as SchemaPageType
+  const checkedFocusKeywords =
+    focusKeywords === undefined ? undefined : readValidatedField('focusKeywords', focusKeywords)
+  if (Array.isArray(checkedFocusKeywords) && checkedFocusKeywords.length > 0) {
+    meta.focusKeywords = checkedFocusKeywords as string[]
   }
-  // Defensive read (G17 spirit): a hand-edited or stale record whose stored
-  // JSON no longer satisfies the write rules is silently dropped — it must
-  // never poison a later full-replace write that merges the current
-  // override (e.g. seo_set_entry_schema setting only schemaType).
-  if (
-    typeof data.customSchemaJson === 'string' &&
-    data.customSchemaJson !== '' &&
-    data.customSchemaJson.length <= CUSTOM_SCHEMA_JSON_MAX &&
-    customSchemaJsonProblem(data.customSchemaJson) === undefined
-  ) {
-    meta.customSchemaJson = data.customSchemaJson
+  const schemaType = readValidatedField('schemaType', data.schemaType)
+  if (typeof schemaType === 'string') meta.schemaType = schemaType as SchemaPageType
+  const customSchemaJson = readValidatedField('customSchemaJson', data.customSchemaJson)
+  if (typeof customSchemaJson === 'string' && customSchemaJson !== '') {
+    meta.customSchemaJson = customSchemaJson
   }
   return meta
 }
@@ -613,6 +767,45 @@ export const TABLE_SLUG_RE = /^[a-z0-9][a-z0-9_-]*$/i
 export const ENTRY_ID_RE = /^[A-Za-z0-9_-]+$/
 
 /**
+ * Length cap for either key component (round 5 triage C#5 — parity with
+ * seoConfig's `TABLE_SLUG_MAX`, which is numerically URL_MAX; declared
+ * locally because seoConfig imports THIS module and the dependency must
+ * not run the other way). Real values are far shorter — host table slugs
+ * are `slugFromTitle` output and entry ids are 21-char nanoids — so this
+ * only bounds the work a hand-rolled request can ask of the charset
+ * checks, and reports the overrun as a named field error instead of a
+ * confusing charset message.
+ */
+export const ENTRY_REF_COMPONENT_MAX = URL_MAX
+
+export interface SeoMetaStorageRef {
+  tableSlug: string
+  entryId: string
+}
+
+/**
+ * Defensively parse a stored `${tableSlug}:${entryId}` key. Invalid or
+ * ambiguous records are not safe GC targets and therefore return undefined.
+ */
+export function parseSeoMetaStorageKey(value: unknown): SeoMetaStorageRef | undefined {
+  if (typeof value !== 'string') return undefined
+  const separator = value.indexOf(':')
+  if (separator <= 0 || value.indexOf(':', separator + 1) !== -1) return undefined
+  const tableSlug = value.slice(0, separator)
+  const entryId = value.slice(separator + 1)
+  if (
+    tableSlug.length > ENTRY_REF_COMPONENT_MAX ||
+    entryId.length === 0 ||
+    entryId.length > ENTRY_REF_COMPONENT_MAX ||
+    !TABLE_SLUG_RE.test(tableSlug) ||
+    !ENTRY_ID_RE.test(entryId)
+  ) {
+    return undefined
+  }
+  return { tableSlug, entryId }
+}
+
+/**
  * Extract + validate the `?table=…&entry=…` entry reference all routes
  * require. Returns field errors (for a 400) when either is missing, empty,
  * or outside its charset (which also rules out `:` in either component).
@@ -626,6 +819,11 @@ export function parseEntryRef(
   const entryId = params.entry ?? ''
   if (tableSlug === '') {
     errors.push({ field: 'table', message: 'required query parameter' })
+  } else if (tableSlug.length > ENTRY_REF_COMPONENT_MAX) {
+    errors.push({
+      field: 'table',
+      message: `must be at most ${ENTRY_REF_COMPONENT_MAX} characters`,
+    })
   } else if (!TABLE_SLUG_RE.test(tableSlug)) {
     errors.push({
       field: 'table',
@@ -634,6 +832,11 @@ export function parseEntryRef(
   }
   if (entryId === '') {
     errors.push({ field: 'entry', message: 'required query parameter' })
+  } else if (entryId.length > ENTRY_REF_COMPONENT_MAX) {
+    errors.push({
+      field: 'entry',
+      message: `must be at most ${ENTRY_REF_COMPONENT_MAX} characters`,
+    })
   } else if (!ENTRY_ID_RE.test(entryId)) {
     errors.push({
       field: 'entry',

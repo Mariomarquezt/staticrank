@@ -19,7 +19,11 @@
  *     body → server carry-forward).
  */
 
-import { validateSeoConfig, type SeoConfigData } from '../../server/seoConfig'
+import {
+  SEO_CONFIG_REQUEST_BODY_MAX,
+  validateSeoConfig,
+  type SeoConfigData,
+} from '../../server/seoConfig'
 import type { FieldError } from '../../server/seoMeta'
 import { FORM_MODELED_SECTIONS } from './configForm'
 
@@ -39,6 +43,28 @@ export interface ConfigExportFile {
   config: SeoConfigData
 }
 
+/**
+ * Keep ONLY what an export may carry: the sections this form models plus
+ * the document `version` marker.
+ *
+ * GET /config returns the stored document PLUS run-state metadata when
+ * something is wrong — top-level `decorationFailures` / `indexNowFailure`
+ * (server/index.ts) — and `parseConfigImport` rejects unknown sections.
+ * Exporting the response body verbatim therefore produced a backup that
+ * refused to import EXACTLY when the site had an active problem (round-5
+ * t4-30). Filtering here is the single choke point: every export path
+ * runs through `buildConfigExport`.
+ */
+export function pickExportableConfig(config: SeoConfigData): SeoConfigData {
+  const source = config as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  if (source.version !== undefined) out.version = source.version
+  for (const section of FORM_MODELED_SECTIONS) {
+    if (source[section] !== undefined) out[section] = source[section]
+  }
+  return out as SeoConfigData
+}
+
 export function buildConfigExport(
   config: SeoConfigData,
   pluginVersion: string,
@@ -48,7 +74,7 @@ export function buildConfigExport(
     _format: CONFIG_EXPORT_FORMAT,
     _pluginVersion: pluginVersion,
     _exportedAt: exportedAt,
-    config,
+    config: pickExportableConfig(config),
   }
 }
 
@@ -62,18 +88,35 @@ export function serializeConfigExport(file: ConfigExportFile): string {
 
 /**
  * Import file size cap (review C#5) — checked against `File.size` BEFORE
- * the file is read into memory. A real export is a few KB; 1 MiB is
- * orders of magnitude of headroom and matches the host's own form-body
- * budget (spike G7).
+ * the file is read into memory.
+ *
+ * DERIVED from the schema's own maxima (round-5 t4-31): the previous flat
+ * 1 MiB sat BELOW a maximal-but-valid document, so a pathological (yet
+ * legal) config — CONFIG_TABLES_MAX table entries with TABLE_SLUG_MAX-long
+ * slugs — exported to a file its own importer refused. `SEO_CONFIG_
+ * REQUEST_BODY_MAX` is the server's worst-case JSON character budget for
+ * the same document (every validator cap, worst-case `\uXXXX` escaping),
+ * and a JSON character never costs more than its escaped form in UTF-8
+ * bytes, so it bounds the config's BYTE length too. The margin covers the
+ * export envelope (`_format`/`_pluginVersion`/`_exportedAt`) and
+ * `JSON.stringify(…, null, 2)` indentation — kilobytes against megabytes —
+ * and the result is rounded up to whole MiB so the operator-facing message
+ * stays a round number. Real exports are still a few KB.
  */
-export const MAX_IMPORT_FILE_BYTES = 1024 * 1024
+const IMPORT_SIZE_MARGIN = 1.25
+const BYTES_PER_MIB = 1024 * 1024
+
+export const MAX_IMPORT_FILE_BYTES =
+  Math.ceil((SEO_CONFIG_REQUEST_BODY_MAX * IMPORT_SIZE_MARGIN) / BYTES_PER_MIB) * BYTES_PER_MIB
 
 export function importFileTooLarge(sizeBytes: number): boolean {
   return sizeBytes > MAX_IMPORT_FILE_BYTES
 }
 
+const IMPORT_CAP_MB = MAX_IMPORT_FILE_BYTES / BYTES_PER_MIB
+
 export const IMPORT_FILE_TOO_LARGE_MESSAGE =
-  'settings file is too large (over 1 MB) — this is not a settings export'
+  `settings file is too large (over ${IMPORT_CAP_MB} MB) — this is not a settings export`
 
 export type ModeledSection = (typeof FORM_MODELED_SECTIONS)[number]
 
@@ -121,7 +164,7 @@ export function parseConfigImport(raw: string): ConfigImportResult {
 
   const modeled: ReadonlyArray<string> = FORM_MODELED_SECTIONS
   const unknown = Object.keys(rawConfig as Record<string, unknown>).filter(
-    (key) => !modeled.includes(key),
+    (key) => key !== 'version' && !modeled.includes(key),
   )
   if (unknown.length > 0) {
     return importError(

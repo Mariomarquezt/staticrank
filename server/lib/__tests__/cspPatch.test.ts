@@ -68,6 +68,14 @@ describe('addScriptSrcSources', () => {
     expect(addScriptSrcSources(policy, ["'sha256-X'"])).toBe(policy)
   })
 
+  test('matches CSP keyword source expressions case-insensitively', () => {
+    const inline = "script-src 'self' 'UNSAFE-INLINE'"
+    expect(addScriptSrcSources(inline, ["'sha256-X'"])).toBe(inline)
+    expect(addScriptSrcSources("script-src 'NONE'", ["'sha256-X'"])).toBe(
+      "script-src 'sha256-X'",
+    )
+  })
+
   test('NEVER creates a missing directive (review B2#3 — would strip the default-src fallback for external scripts)', () => {
     const policy = "default-src 'self'"
     expect(addScriptSrcSources(policy, ["'sha256-X'"])).toBe(policy)
@@ -137,6 +145,13 @@ describe('findCspMetas — serialization variants (review B2#3)', () => {
   test('a CSP meta without a content attribute is ignored', () => {
     expect(findCspMetas('<meta http-equiv="Content-Security-Policy">').length).toBe(0)
   })
+
+  test('an unterminated quoted tag does not hide a later CSP meta', () => {
+    const doc =
+      '<head><meta name="broken" content="unclosed >' +
+      '<meta http-equiv="Content-Security-Policy" content="script-src \'self\'"></head>'
+    expect(findCspMetas(doc).map((meta) => meta.policy)).toEqual(["script-src 'self'"])
+  })
 })
 
 describe('allowInlineScripts (end to end)', () => {
@@ -198,5 +213,33 @@ describe('allowInlineScripts (end to end)', () => {
   test('empty text list is a no-op', async () => {
     const doc = DOC("script-src 'none'")
     expect(await allowInlineScripts(doc, [])).toBe(doc)
+  })
+
+  test('escapes a hash when the content attribute uses single quotes', async () => {
+    const doc = `<meta http-equiv="Content-Security-Policy" content='script-src self'>`
+    const text = 'alert(1);'
+    const hash = await scriptHashSource(text)
+    const out = await allowInlineScripts(doc, [text])
+    expect(out).toBe(`<meta http-equiv="Content-Security-Policy" content='script-src self ${hash.replaceAll("'", '&#39;')}'>`)
+    expect(findCspMetas(out!).map((meta) => meta.policy)).toEqual([`script-src self ${hash}`])
+  })
+
+  test('quotes an originally unquoted content attribute before adding the hash', async () => {
+    const text = 'alert(1);'
+    const hash = await scriptHashSource(text)
+    const out = await allowInlineScripts(
+      '<meta http-equiv="Content-Security-Policy" content=script-src>',
+      [text],
+    )
+    expect(out).toContain(`content="script-src ${hash}"`)
+    expect(findCspMetas(out!).map((meta) => meta.policy)).toEqual([`script-src ${hash}`])
+  })
+
+  test('patches script-src-elem because it governs classic inline script tags', async () => {
+    const text = 'alert(1);'
+    const hash = await scriptHashSource(text)
+    const out = await allowInlineScripts(DOC("script-src 'self'; script-src-elem 'self'"), [text])
+    expect(out).toContain(`script-src 'self' ${hash}`)
+    expect(out).toContain(`script-src-elem 'self' ${hash}`)
   })
 })

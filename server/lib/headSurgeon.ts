@@ -55,20 +55,21 @@ export interface SeoHeadPayload {
 const SEO_START = '<!--seo:start-->'
 const SEO_END = '<!--seo:end-->'
 
-/** First closing head tag, case-insensitive, tolerating `</head >`. */
-const HEAD_CLOSE_RE = /<\/head\s*>/i
-
-/** A <title …> open tag, case-insensitive, attributes tolerated. */
-const TITLE_OPEN_RE = /<title\b[^>]*>/gi
-
-/** A </title> close tag, case-insensitive, tolerating `</title >`. */
-const TITLE_CLOSE_RE = /<\/title\s*>/gi
-
-/** A raw-text element open at a `<`: its body must be masked from matching. */
-const RAW_TEXT_OPEN_RE = /^<(script|style|noscript)\b/i
-
-/** A `<meta` tag open, case-insensitive. Tag end is found by the tokenizer. */
-const META_OPEN_RE = /<meta\b/gi
+/**
+ * Index just past the end of the comment that starts at `lt` (`html[lt] === '<'`
+ * and `html.startsWith('<!--', lt)`), or `html.length` when it is never closed.
+ *
+ * The HTML tokenizer treats the ABRUPT forms `<!-->` and `<!--->` as COMPLETE
+ * (empty) comments rather than unterminated ones — without that rule a lone
+ * `<!-->` in the head would mask every later tag (including `</head>`) from the
+ * scanners here, while the browser keeps parsing normally.
+ */
+export function findCommentEnd(html: string, lt: number): number {
+  if (html.charCodeAt(lt + 4) === 62 /* > */) return lt + 5 // <!-->
+  if (html.startsWith('->', lt + 4)) return lt + 6 // <!--->
+  const close = html.indexOf('-->', lt + 4)
+  return close === -1 ? html.length : close + 3
+}
 
 /** [start, end) ranges of head content that must not be matched against. */
 type Mask = [number, number]
@@ -136,13 +137,13 @@ export function applySeoHead(html: string, payload: SeoHeadPayload): string {
     return html
   }
 
-  const headClose = HEAD_CLOSE_RE.exec(html)
-  if (!headClose) return html
+  const headClose = findHeadClose(html)
+  if (headClose === -1) return html
 
   // Everything strictly before `</head>` is ours; the tag itself and all
   // bytes after it pass through untouched.
-  let head = html.slice(0, headClose.index)
-  const tail = html.slice(headClose.index)
+  let head = html.slice(0, headClose)
+  const tail = html.slice(headClose)
 
   // 1. Strip every stale plugin block so re-publishing never accumulates tags.
   head = removeSeoBlocks(head)
@@ -202,6 +203,57 @@ function stripMarkers(block: string): string {
 }
 
 /**
+ * Find the first real closing `</head>` tag. Comments and the bodies of
+ * script/style/noscript are opaque, so a literal closing tag in either cannot
+ * become the publish-time surgery anchor.
+ */
+export function findHeadClose(html: string): number {
+  const lower = html.toLowerCase()
+  let i = 0
+  while (i < html.length) {
+    const lt = html.indexOf('<', i)
+    if (lt === -1) return -1
+    if (html.startsWith('<!--', lt)) {
+      i = findCommentEnd(html, lt)
+      continue
+    }
+    if (lower.startsWith('</head', lt)) {
+      const afterName = lower[lt + 6]
+      if (
+        (afterName === undefined || afterName === '>' || /\s/.test(afterName)) &&
+        isHeadCloseAt(html, lt)
+      ) {
+        return lt
+      }
+    }
+    const raw = rawTextNameAt(lower, lt)
+    if (raw !== undefined) {
+      const openEnd = findTagEnd(html, lt)
+      if (openEnd >= html.length && html.charCodeAt(html.length - 1) !== 62) return -1
+      const closeAt = findRawClose(lower, raw, openEnd)
+      if (closeAt === -1) return -1
+      const closeEnd = findTagEnd(html, closeAt)
+      i = closeEnd
+      continue
+    }
+    const tagEnd = closedTagEnd(html, lower, lt)
+    if (tagEnd !== null) {
+      i = tagEnd
+      continue
+    }
+    i = lt + 1
+  }
+  return -1
+}
+
+/** Exact indexed equivalent of the anchored /^<\/head\s*>/i check above. */
+function isHeadCloseAt(html: string, lt: number): boolean {
+  let i = lt + 6 // past '</head'; caller already matched it case-insensitively
+  while (i < html.length && /\s/.test(html[i])) i++
+  return html[i] === '>'
+}
+
+/**
  * Compute masked ranges within the head region: ordinary HTML comments and
  * the full extent of script/style/noscript elements. The exact marker
  * comments `<!--seo:start-->`/`<!--seo:end-->` are NOT masked — they are our
@@ -225,31 +277,106 @@ function computeMasks(head: string): Mask[] {
         i = lt + SEO_END.length
         continue
       }
-      const close = head.indexOf('-->', lt + 4)
-      const end = close === -1 ? n : close + 3
+      const end = Math.min(findCommentEnd(head, lt), n)
       masks.push([lt, end])
       i = end
       continue
     }
-    const raw = RAW_TEXT_OPEN_RE.exec(head.slice(lt, lt + 11))
-    if (raw) {
-      const name = raw[1].toLowerCase()
-      const openEnd = head.indexOf('>', lt)
+    const name = rawTextNameAt(lower, lt)
+    if (name !== undefined) {
+      const openEnd = findTagEnd(head, lt)
       let end = n
-      if (openEnd !== -1) {
-        const closeIdx = lower.indexOf('</' + name, openEnd + 1)
-        if (closeIdx !== -1) {
-          const closeGt = head.indexOf('>', closeIdx)
-          end = closeGt === -1 ? n : closeGt + 1
-        }
+      if (openEnd < n || head.charCodeAt(n - 1) === 62) {
+        const closeIdx = findRawClose(lower, name, openEnd)
+        if (closeIdx !== -1) end = findTagEnd(head, closeIdx)
       }
       masks.push([lt, end])
       i = end
       continue
     }
+    const tagEnd = closedTagEnd(head, lower, lt)
+    if (tagEnd !== null) {
+      i = tagEnd
+      continue
+    }
     i = lt + 1
   }
   return masks
+}
+
+function rawTextNameAt(lower: string, lt: number): string | undefined {
+  // Match at `lt`: slicing the suffix here makes the enclosing scans copy
+  // the whole remaining document once per '<'. The literals are already
+  // lower-case and isTagNameBoundary preserves (?=[\s/>]|$) exactly.
+  if (lower.startsWith('<script', lt) && isTagNameBoundary(lower[lt + 7])) return 'script'
+  if (lower.startsWith('<style', lt) && isTagNameBoundary(lower[lt + 6])) return 'style'
+  if (lower.startsWith('<noscript', lt) && isTagNameBoundary(lower[lt + 9])) return 'noscript'
+  return undefined
+}
+
+function isTagNameBoundary(ch: string | undefined): boolean {
+  return ch === undefined || ch === '>' || ch === '/' || /\s/.test(ch)
+}
+
+function isPotentialTagStart(lower: string, lt: number): boolean {
+  const ch = lower[lt + 1]
+  return ch !== undefined && (/[a-z]/.test(ch) || ch === '/' || ch === '!' || ch === '?')
+}
+
+function isOpeningTagAt(lower: string, lt: number, name: string): boolean {
+  const nameStart = lt + 1
+  return lower.startsWith(name, nameStart) && isTagNameBoundary(lower[nameStart + name.length])
+}
+
+/** Return a quote-aware tag end, or null when no closing `>` is available. */
+function closedTagEnd(html: string, lower: string, start: number): number | null {
+  if (!isPotentialTagStart(lower, start)) return null
+  const end = findTagEnd(html, start)
+  return end > start && html.charCodeAt(end - 1) === 62 ? end : null
+}
+
+function maskAt(masks: Mask[], position: number): Mask | undefined {
+  for (let i = 0; i < masks.length; i++) {
+    const mask = masks[i]
+    if (mask[0] <= position && position < mask[1]) return mask
+    if (mask[0] > position) break
+  }
+  return undefined
+}
+
+function findRawClose(lower: string, name: string, from: number): number {
+  let i = from
+  for (;;) {
+    const at = lower.indexOf('</' + name, i)
+    if (at === -1) return -1
+    if (isTagNameBoundary(lower[at + name.length + 2])) return at
+    i = at + 1
+  }
+}
+
+/** Find a tag's closing `>`; quotes only begin at the start of an attribute value. */
+function findTagEnd(html: string, start: number): number {
+  let quote = 0
+  let afterEquals = false
+  for (let i = start + 1; i < html.length; i++) {
+    const code = html.charCodeAt(i)
+    if (quote !== 0) {
+      if (code === quote) quote = 0
+      continue
+    }
+    if (code === 61 /* = */) {
+      afterEquals = true
+      continue
+    }
+    if (afterEquals && (code === 34 || code === 39)) {
+      quote = code
+      afterEquals = false
+      continue
+    }
+    if (code === 62 /* > */) return i + 1
+    if (afterEquals && !isWsCode(code)) afterEquals = false
+  }
+  return html.length
 }
 
 /** Does [start, end) overlap any mask? */
@@ -320,6 +447,64 @@ function removeSeoBlocks(head: string): string {
   return out + head.slice(cursor)
 }
 
+function findNextOpeningTag(
+  head: string,
+  name: string,
+  from: number,
+  masks: Mask[],
+): { start: number; end: number } | null {
+  const lower = head.toLowerCase()
+  let i = from
+  while (i < head.length) {
+    const lt = head.indexOf('<', i)
+    if (lt === -1) return null
+    const mask = maskAt(masks, lt)
+    if (mask !== undefined) {
+      i = mask[1]
+      continue
+    }
+    if (isOpeningTagAt(lower, lt, name)) {
+      const end = closedTagEnd(head, lower, lt)
+      return end === null ? null : { start: lt, end }
+    }
+    i = closedTagEnd(head, lower, lt) ?? lt + 1
+  }
+  return null
+}
+
+function findClosingTag(
+  head: string,
+  name: string,
+  from: number,
+  masks: Mask[],
+): { start: number; end: number } | null {
+  const lower = head.toLowerCase()
+  let i = from
+  while (i < head.length) {
+    const lt = head.indexOf('<', i)
+    if (lt === -1) return null
+    const mask = maskAt(masks, lt)
+    if (mask !== undefined) {
+      i = mask[1]
+      continue
+    }
+    const nameStart = lt + 2
+    if (
+      lower.startsWith(name, nameStart) &&
+      isTagNameBoundary(lower[nameStart + name.length])
+    ) {
+      // An end tag may legally carry (ignored) attributes — `</title data-x>`
+      // still closes the element in every browser, and metaBlock's twin scan
+      // already accepts it. Consume them quote-aware via findTagEnd so the
+      // two readers of the same document agree on where the title ends.
+      const end = findTagEnd(head, lt)
+      if (end > lt && head.charCodeAt(end - 1) === 62) return { start: lt, end }
+    }
+    i = closedTagEnd(head, lower, lt) ?? lt + 1
+  }
+  return null
+}
+
 /**
  * Locate the first unmasked <title> element. Returns null when there is none
  * (including an open tag with no matching close — no safe content range).
@@ -328,22 +513,16 @@ function findTitle(
   head: string,
   masks: Mask[]
 ): { tagStart: number; contentStart: number; contentEnd: number; tagEnd: number } | null {
-  TITLE_OPEN_RE.lastIndex = 0
-  let open: RegExpExecArray | null
-  while ((open = TITLE_OPEN_RE.exec(head)) !== null) {
-    if (isMasked(masks, open.index, open.index + open[0].length)) continue
-    const contentStart = open.index + open[0].length
-    TITLE_CLOSE_RE.lastIndex = contentStart
-    const close = TITLE_CLOSE_RE.exec(head)
-    if (!close) return null
-    return {
-      tagStart: open.index,
-      contentStart,
-      contentEnd: close.index,
-      tagEnd: close.index + close[0].length,
-    }
+  const open = findNextOpeningTag(head, 'title', 0, masks)
+  if (open === null) return null
+  const close = findClosingTag(head, 'title', open.end, masks)
+  if (close === null) return null
+  return {
+    tagStart: open.start,
+    contentStart: open.end,
+    contentEnd: close.start,
+    tagEnd: close.end,
   }
-  return null
 }
 
 /**
@@ -355,15 +534,23 @@ function findTitle(
  */
 function findDescriptionMetas(head: string, masks: Mask[]): ParsedMetaTag[] {
   const found: ParsedMetaTag[] = []
-  META_OPEN_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = META_OPEN_RE.exec(head)) !== null) {
-    const parsed = parseMetaTag(head, m.index)
-    if (!parsed) {
-      META_OPEN_RE.lastIndex = m.index + m[0].length
+  const lower = head.toLowerCase()
+  let i = 0
+  while (i < head.length) {
+    const lt = head.indexOf('<', i)
+    if (lt === -1) break
+    const mask = maskAt(masks, lt)
+    if (mask !== undefined) {
+      i = mask[1]
       continue
     }
-    META_OPEN_RE.lastIndex = parsed.end
+    if (!isOpeningTagAt(lower, lt, 'meta')) {
+      i = closedTagEnd(head, lower, lt) ?? lt + 1
+      continue
+    }
+    const parsed = parseMetaTag(head, lt)
+    if (!parsed) break
+    i = parsed.end
     if (isMasked(masks, parsed.start, parsed.end)) continue
     const nameAttr = parsed.attrs.find((a) => a.name.toLowerCase() === 'name')
     if (nameAttr && nameAttr.value !== null && nameAttr.value.toLowerCase() === 'description') {

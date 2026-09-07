@@ -8,7 +8,7 @@ import {
   generateIndexNowKey,
   shouldFlushIndexNow,
   submitIndexNow,
-  INDEXNOW_CLEAR_CAP,
+  INDEXNOW_URLS_PER_POST,
   type FetchLike,
 } from './indexNow'
 import { buildLlmsTxt } from './llmsTxt'
@@ -28,9 +28,13 @@ import {
   beaconPath,
   buildAnalyticsConfigTag,
   buildStatsPayload,
-  flushDayCounts,
+  deserializeDayCounts,
+  mergeDayCounts,
   newestDayTotals,
   pruneExpiredDayRecords,
+  serializeDayCounts,
+  type DayCollectionLike,
+  type DrainedDay,
 } from './analytics'
 import { allowInlineScripts, extractImportmapText, planInlineCsp } from './lib/cspPatch'
 import { auditImages } from './lib/imageAudit'
@@ -53,14 +57,19 @@ import {
   planSeoConfigReplace,
   resolveConfigSections,
   serializeSeoConfig,
+  isSeoConfigRequestBodyWithinLimit,
   validateSeoConfig,
 } from './seoConfig'
 import {
   SEO_STATE_RESOURCE_ID,
+  clearIndexNowState,
+  loadDecorationFailure,
+  recordDecorationFailure,
   loadIndexNowState,
   loadReconcileCursor,
   patchIndexNowState,
   saveReconcileCursor,
+  type StateCollectionLike,
 } from './seoState'
 import {
   RECONCILE_BATCH_SIZE,
@@ -84,12 +93,17 @@ import {
 import { getTemplatePageInfo } from './templateDetect'
 import {
   SEO_META_RESOURCE_ID,
+  SEO_META_CLEANUP_CAP,
+  SEO_META_RECONCILE_BATCH_SIZE,
+  SEO_META_RECONCILE_STATE_KEY,
   deserializeSeoMeta,
   isEmptySeoMeta,
   parseEntryRef,
   parseJsonBody,
+  parseSeoMetaStorageKey,
   seoMetaKey,
   serializeSeoMeta,
+  isSeoMetaRequestBodyWithinLimit,
   validateSeoMeta,
   type FieldError,
 } from './seoMeta'
@@ -222,6 +236,72 @@ function notFoundCollection(api: ServerPluginApi) {
   return api.cms.storage.collection(SEO_NOTFOUND_RESOURCE_ID)
 }
 
+export const MAINTENANCE_BUDGET_MS = 9_000
+
+interface MaintenanceDeadline {
+  clock: () => number
+  expiresAt: number
+}
+
+interface MaintenanceRecordLike {
+  id: string
+  data: Record<string, unknown>
+}
+
+interface MaintenanceCollectionLike {
+  list: (options?: {
+    filter?: Record<string, unknown>
+    orderBy?: Record<string, 'asc' | 'desc'>
+    limit?: number
+    offset?: number
+  }) => Promise<{ records: MaintenanceRecordLike[] }>
+  create: (data: Record<string, unknown>) => Promise<unknown>
+  update: (recordId: string, data: Record<string, unknown>) => Promise<unknown>
+  delete: (recordId: string) => Promise<unknown>
+}
+
+const MAINTENANCE_DEADLINE_REACHED = {}
+
+function maintenanceHasTime(deadline: MaintenanceDeadline): boolean {
+  return deadline.clock() < deadline.expiresAt
+}
+
+function requireMaintenanceTime(deadline: MaintenanceDeadline): void {
+  if (!maintenanceHasTime(deadline)) throw MAINTENANCE_DEADLINE_REACHED
+}
+
+/** Some maintenance helpers issue several RPCs behind one call. Guarding
+ * the collection makes the shared deadline apply to every one of them. */
+function deadlineCollection(
+  collection: MaintenanceCollectionLike,
+  deadline: MaintenanceDeadline,
+): MaintenanceCollectionLike {
+  return {
+    list: async (options) => {
+      requireMaintenanceTime(deadline)
+      return collection.list(options)
+    },
+    create: async (data) => {
+      requireMaintenanceTime(deadline)
+      return collection.create(data)
+    },
+    update: async (recordId, data) => {
+      requireMaintenanceTime(deadline)
+      return collection.update(recordId, data)
+    },
+    delete: async (recordId) => {
+      requireMaintenanceTime(deadline)
+      return collection.delete(recordId)
+    },
+  }
+}
+
+function maintenanceCollection(
+  collection: ReturnType<ServerPluginApi['cms']['storage']['collection']>,
+): MaintenanceCollectionLike {
+  return collection as unknown as MaintenanceCollectionLike
+}
+
 // ---------------------------------------------------------------------------
 // Task 2.4 module state — beacon aggregation + per-VM rate limiting
 // ---------------------------------------------------------------------------
@@ -237,8 +317,38 @@ function notFoundCollection(api: ServerPluginApi) {
  */
 const pageViewCounts = new BeaconAggregator(ANALYTICS_PATH_CAP)
 const notFoundCounts = new BeaconAggregator(NOTFOUND_PATH_CAP)
+const pendingPageViewDays: DrainedDay[] = []
+const pendingNotFoundDays: DrainedDay[] = []
 const beaconBucket = new TokenBucket(BEACON_RATE_PER_MIN)
 const notFoundBucket = new TokenBucket(NOTFOUND_RATE_PER_MIN)
+
+/** Keep a drained bucket in module state until its write succeeds. The
+ * analytics helper normally accepts loss on write failure, but a deliberate
+ * deadline stop must be resumable rather than discard the drained counts. */
+async function flushDayCountsWithinDeadline(
+  aggregator: BeaconAggregator,
+  pending: DrainedDay[],
+  collection: DayCollectionLike,
+  pathCap: number,
+  deadline: MaintenanceDeadline,
+): Promise<void> {
+  if (pending.length === 0 && aggregator.hasCounts()) pending.push(...aggregator.drain())
+  while (pending.length > 0) {
+    requireMaintenanceTime(deadline)
+    const drained = pending[0]!
+    const { records } = await collection.list({
+      filter: { key: `day:${drained.day}` },
+      limit: 10,
+    })
+    const newest = records[0]
+    const existing = newest !== undefined ? deserializeDayCounts(newest.data) : undefined
+    const data = serializeDayCounts(mergeDayCounts(existing, drained, pathCap))
+    requireMaintenanceTime(deadline)
+    if (newest !== undefined) await collection.update(newest.id, data)
+    else await collection.create(data)
+    pending.shift()
+  }
+}
 
 /** Beacon routes ALWAYS answer 204 — success, drop, and error alike. */
 const NO_CONTENT = { __response: true, status: 204, headers: {}, body: '' }
@@ -259,7 +369,11 @@ const NO_CONTENT = { __response: true, status: 204, headers: {}, body: '' }
  * pin (folded into the G11 upstream ask), so two overlapping renders of
  * the SAME pageId can interleave filter/after and one after-handler may
  * observe the other render's stash — the damage is bounded to one
- * slightly-stale record write, self-corrected by the next publish. A VM
+ * slightly-stale record write, self-corrected by the next publish. What
+ * is NOT accepted (round-5 wave-2 O#1) is an after-handler consuming a
+ * stash from an EARLIER, already-superseded render: every filter attempt
+ * clears the page's slot before it runs (`clearPageStash`), so a stash
+ * can only ever come from the render whose filter most recently ran. A VM
  * restart between filter and event loses the stash; the after-handler
  * no-ops on a missing stash and the page is re-tracked on its next
  * render. Bounded map: oldest entry evicted at the cap (entries are
@@ -278,10 +392,55 @@ function stashPage(pageId: string, stash: PageStash): void {
   pageStash.set(pageId, stash)
 }
 
+/**
+ * Pages whose SEO decoration threw during this VM's lifetime. The filter
+ * is read-only, so it only records the pageId here; `publish.after`
+ * persists the count into `seo-state` where the admin can surface it.
+ * Bounded like the page stash — a pathological run cannot grow it.
+ */
+const decorationFailures = new Set<string>()
+
+function stashDecorationFailure(pageId: string): void {
+  if (decorationFailures.size >= PAGE_STASH_CAP) return
+  decorationFailures.add(pageId)
+}
+
+/** Drain the failures recorded since the last drain. */
+export function takeDecorationFailures(): string[] {
+  const ids = [...decorationFailures]
+  decorationFailures.clear()
+  return ids
+}
+
 function takePageStash(pageId: string): PageStash | undefined {
   const stash = pageStash.get(pageId)
   if (stash !== undefined) pageStash.delete(pageId)
   return stash
+}
+
+/**
+ * Drop any stash the page is still carrying (round-5 wave-2 O#1).
+ *
+ * There is no render-correlation id at this pin, so a stash is only
+ * trustworthy as "the render whose filter just ran". The filter therefore
+ * clears the slot BEFORE it does anything that can throw: without this, a
+ * filter that fails (or a render that is skipped for being a template)
+ * leaves the PREVIOUS render's facts in place, and the publish.after that
+ * follows consumes them as if they described the document just published.
+ *
+ * The concrete loss that motivated it: publish /old, let its publish.after
+ * sitemap write fail (the catch re-stashes for the retry), rename the page
+ * to /new, and let the /new filter fail — the /new publish.after would pop
+ * the stale /old facts, write /old back into the sitemap and mark it
+ * pending, queueing the obsolete URL for IndexNow.
+ *
+ * Cost, accepted: a failed filter now also discards a re-stashed retry.
+ * That is the point — a render that could not be decorated cannot vouch
+ * for the previous render's slug/fingerprint either, and the page is
+ * re-tracked on its next successful render.
+ */
+function clearPageStash(pageId: string): void {
+  pageStash.delete(pageId)
 }
 
 /** Flush throttle + reentrancy guard (per VM; pending-ness itself is durable). */
@@ -300,15 +459,23 @@ let indexNowInFlight = false
  * Failures log-and-continue; the throttle guard stays as defense in
  * depth against overlapping schedule fires.
  */
-async function flushIndexNow(api: ServerPluginApi, now: number = Date.now()): Promise<void> {
+async function flushIndexNow(
+  api: ServerPluginApi,
+  now: number,
+  deadline: MaintenanceDeadline,
+): Promise<void> {
   if (indexNowInFlight || !shouldFlushIndexNow(indexNowLastFlushAt, now)) return
   indexNowInFlight = true
   try {
-    const config = await loadSeoConfig(seoConfigCollection(api))
+    const configCollection = deadlineCollection(
+      maintenanceCollection(seoConfigCollection(api)),
+      deadline,
+    )
+    const config = await loadSeoConfig(configCollection)
     const siteUrl = normalizeSiteOrigin(config.site?.siteUrl)
     if (siteUrl === undefined || !indexNowEnabled(config)) return
 
-    const collection = sitemapCollection(api)
+    const collection = deadlineCollection(maintenanceCollection(sitemapCollection(api)), deadline)
     const { records } = await collection.list({ filter: { pending: true }, limit: 500 })
     const pending: Array<{ record: (typeof records)[number]; entry: SitemapEntry }> = []
     for (const record of records) {
@@ -322,8 +489,11 @@ async function flushIndexNow(api: ServerPluginApi, now: number = Date.now()): Pr
     // for the Math.random quality caveat). Persisted to seo-state before
     // first use so the public key route serves it from then on;
     // loadIndexNowState also lifts legacy seo-config-embedded state.
-    const stateCollection = seoStateCollection(api)
-    const state = await loadIndexNowState(stateCollection, seoConfigCollection(api))
+    const stateCollection = deadlineCollection(
+      maintenanceCollection(seoStateCollection(api)),
+      deadline,
+    )
+    const state = await loadIndexNowState(stateCollection, configCollection)
     let key = state.key
     if (key === undefined) {
       key = generateIndexNowKey()
@@ -335,10 +505,23 @@ async function flushIndexNow(api: ServerPluginApi, now: number = Date.now()): Pr
     const batch = pending.slice(0, INDEXNOW_URLS_PER_POST)
     const urls = batch.map((item) => pageUrl(siteUrl, item.entry.slug))
     const payload = buildIndexNowPayload(siteUrl, key, keyLocation, urls)
-    if (payload === undefined) return
-
-    const result = await submitIndexNow(globalThis.fetch as unknown as FetchLike, payload)
     const nowIso = new Date(now).toISOString()
+    if (payload === undefined) {
+      const error = 'invalid IndexNow key'
+      api.plugin.log('indexnow payload error:', error)
+      await patchIndexNowState(stateCollection, {
+        lastSubmittedAt: nowIso,
+        lastStatus: `error: ${error}`,
+      })
+      return
+    }
+
+    requireMaintenanceTime(deadline)
+    const result = await submitIndexNow(
+      globalThis.fetch as unknown as FetchLike,
+      payload,
+      Math.max(1, deadline.expiresAt - deadline.clock()),
+    )
     if (result.ok) {
       // Review #6: RE-READ before clearing. A publish that landed during
       // the POST re-marked its record (or rewrote slug/fp); clear only
@@ -382,7 +565,9 @@ async function flushIndexNow(api: ServerPluginApi, now: number = Date.now()): Pr
       })
     }
   } catch (err) {
-    api.plugin.log('indexnow flush error:', err instanceof Error ? err.message : String(err))
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('indexnow flush error:', err instanceof Error ? err.message : String(err))
+    }
   } finally {
     indexNowInFlight = false
   }
@@ -433,8 +618,14 @@ async function listSeoMetaRecords(api: ServerPluginApi, key: string) {
   return records
 }
 
-/** Per-request cap on stale-duplicate cleanup deletions (route paths). */
-const META_CLEANUP_CAP = 25
+/**
+ * DELETE /meta sweeps in list-then-delete passes because the list is
+ * capped. Bounded so a pathological key (or a writer racing the delete)
+ * can never spin the request: 100 records per pass × 20 passes = 2000,
+ * far beyond any real duplicate count, and the response reports honestly
+ * if something is still there afterwards.
+ */
+const META_DELETE_MAX_PASSES = 20
 
 /**
  * READ-ONLY newest-wins resolve for the publish filter: duplicates are
@@ -450,20 +641,272 @@ async function readNewestSeoMetaRecord(api: ServerPluginApi, key: string) {
  * Self-healing resolve for the AUTHENTICATED routes: returns the newest
  * record for the key and deletes stale duplicates left behind by a write
  * race (G10: no unique key/upsert at this pin), capped at
- * META_CLEANUP_CAP deletions per request — leftovers get the next one.
+ * SEO_META_CLEANUP_CAP deletions per request — leftovers get the next one.
  */
 async function resolveSeoMetaRecord(api: ServerPluginApi, key: string) {
   const [newest, ...stale] = await listSeoMetaRecords(api, key)
-  for (const record of stale.slice(0, META_CLEANUP_CAP)) {
+  for (const record of stale.slice(0, SEO_META_CLEANUP_CAP)) {
     await seoMetaCollection(api).delete(record.id)
   }
   return newest ?? null
+}
+
+/**
+ * Dedicated seo-meta reconcile cursor in seo-state. Reads are newest-wins
+ * and writes are update-else-create, matching the sitemap cursor's G10
+ * discipline while keeping the two independently paged collections apart.
+ */
+async function loadSeoMetaReconcileCursor(collection: StateCollectionLike): Promise<number> {
+  const { records } = await collection.list({
+    filter: { key: SEO_META_RECONCILE_STATE_KEY },
+    limit: 100,
+  })
+  const value = records[0]?.data.cursor
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0
+}
+
+async function saveSeoMetaReconcileCursor(
+  collection: StateCollectionLike,
+  cursor: number,
+): Promise<void> {
+  const { records } = await collection.list({
+    filter: { key: SEO_META_RECONCILE_STATE_KEY },
+    limit: 100,
+  })
+  const data = {
+    key: SEO_META_RECONCILE_STATE_KEY,
+    cursor: Math.max(0, Math.floor(cursor)),
+  }
+  if (records[0]) await collection.update(records[0].id, data)
+  else await collection.create(data)
+}
+
+export interface MaintenanceTickOptions {
+  clock?: () => number
+  budgetMs?: number
+}
+
+/** One deadline covers the complete scheduled handler. Nine seconds comes
+ * from the measured ~11.7 s host ceiling and leaves ~2.7 s for a slow final
+ * RPC and handler teardown. IndexNow runs first because prompt submission is
+ * correctness-sensitive; bounded local drains/reconciles run before the
+ * potentially expensive Pro work so they cannot be starved by it. */
+export async function runMaintenanceTick(
+  api: ServerPluginApi,
+  options: MaintenanceTickOptions = {},
+): Promise<void> {
+  const clock = options.clock ?? Date.now
+  const startedAt = clock()
+  const deadline: MaintenanceDeadline = {
+    clock,
+    expiresAt: startedAt + (options.budgetMs ?? MAINTENANCE_BUDGET_MS),
+  }
+
+  try {
+    await flushIndexNow(api, startedAt, deadline)
+  } catch (err) {
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('indexnow stage error:', err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (!maintenanceHasTime(deadline)) return
+
+  // Drained count buckets remain in module state until their write lands;
+  // a deliberate deadline stop therefore resumes instead of losing them.
+  try {
+    const analytics = deadlineCollection(
+      maintenanceCollection(analyticsCollection(api)),
+      deadline,
+    ) as DayCollectionLike
+    const notFound = deadlineCollection(
+      maintenanceCollection(notFoundCollection(api)),
+      deadline,
+    ) as DayCollectionLike
+    await flushDayCountsWithinDeadline(
+      pageViewCounts,
+      pendingPageViewDays,
+      analytics,
+      ANALYTICS_PATH_CAP,
+      deadline,
+    )
+    await flushDayCountsWithinDeadline(
+      notFoundCounts,
+      pendingNotFoundDays,
+      notFound,
+      NOTFOUND_PATH_CAP,
+      deadline,
+    )
+    await pruneExpiredDayRecords(analytics, startedAt)
+    await pruneExpiredDayRecords(notFound, startedAt)
+  } catch (err) {
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('beacon flush error:', err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (!maintenanceHasTime(deadline)) return
+
+  // Page meta is retained for every existing page row. A partial batch
+  // advances only over records whose verdict/write finished; persisted
+  // deletes and the cursor arithmetic therefore resume without skipping.
+  try {
+    const collection = deadlineCollection(
+      maintenanceCollection(seoMetaCollection(api)),
+      deadline,
+    )
+    const stateCollection = deadlineCollection(
+      maintenanceCollection(seoStateCollection(api)),
+      deadline,
+    )
+    const pages = api.cms.content.table(PAGES_TABLE_SLUG)
+    const cursor = await loadSeoMetaReconcileCursor(stateCollection)
+    const { records } = await collection.list({
+      limit: SEO_META_RECONCILE_BATCH_SIZE,
+      offset: cursor,
+    })
+    if (records.length === 0) {
+      if (cursor !== 0) await saveSeoMetaReconcileCursor(stateCollection, 0)
+    } else {
+      const pageCache = new Map<string, 'exists' | 'missing' | 'ambiguous'>()
+      let processed = 0
+      let deleted = 0
+      let deleteAttempts = 0
+      for (const record of records) {
+        if (!maintenanceHasTime(deadline) || deleteAttempts >= SEO_META_CLEANUP_CAP) break
+        const ref = parseSeoMetaStorageKey(record.data.key)
+        if (ref === undefined || ref.tableSlug !== PAGES_TABLE_SLUG) {
+          processed++
+          continue
+        }
+
+        let verdict = pageCache.get(ref.entryId)
+        if (verdict === undefined) {
+          if (!maintenanceHasTime(deadline)) break
+          try {
+            const row = await pages.get(ref.entryId)
+            verdict = row === null ? 'missing' : row === undefined ? 'ambiguous' : 'exists'
+            pageCache.set(ref.entryId, verdict)
+          } catch (err) {
+            pageCache.set(ref.entryId, 'ambiguous')
+            api.plugin.log(
+              'seo-meta reconcile page lookup error:',
+              err instanceof Error ? err.message : String(err),
+            )
+            processed++
+            continue
+          }
+        }
+        if (verdict === 'missing') {
+          if (!maintenanceHasTime(deadline)) break
+          deleteAttempts++
+          try {
+            await collection.delete(record.id)
+            deleted++
+          } catch (err) {
+            if (err === MAINTENANCE_DEADLINE_REACHED) break
+            api.plugin.log(
+              'seo-meta reconcile delete error:',
+              err instanceof Error ? err.message : String(err),
+            )
+          }
+        }
+        processed++
+      }
+
+      const reachedEnd =
+        processed === records.length && records.length < SEO_META_RECONCILE_BATCH_SIZE
+      const next = reachedEnd ? 0 : cursor + processed - deleted
+      if (next !== cursor) await saveSeoMetaReconcileCursor(stateCollection, next)
+    }
+  } catch (err) {
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('seo-meta reconcile error:', err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (!maintenanceHasTime(deadline)) return
+
+  try {
+    const collection = deadlineCollection(
+      maintenanceCollection(sitemapCollection(api)),
+      deadline,
+    )
+    const stateCollection = deadlineCollection(
+      maintenanceCollection(seoStateCollection(api)),
+      deadline,
+    )
+    const pages = api.cms.content.table(PAGES_TABLE_SLUG)
+    const cursor = await loadReconcileCursor(stateCollection)
+    const { records } = await collection.list({
+      limit: RECONCILE_BATCH_SIZE,
+      offset: cursor,
+    })
+    if (records.length === 0) {
+      if (cursor !== 0) await saveReconcileCursor(stateCollection, 0)
+    } else {
+      const pageCache = new Map<string, ReconcilePageInfo | null>()
+      let processed = 0
+      let deleted = 0
+      for (const record of records) {
+        if (!maintenanceHasTime(deadline) || deleted >= SITEMAP_CLEANUP_CAP) break
+        const entry = deserializeSitemapRecord(record.data)
+        let page: ReconcilePageInfo | null = null
+        if (entry !== undefined) {
+          const cached = pageCache.get(entry.pageId)
+          if (cached !== undefined) {
+            page = cached
+          } else {
+            if (!maintenanceHasTime(deadline)) break
+            const row = await pages.get(entry.pageId)
+            page = row ? { status: row.status, cells: row.cells } : null
+            pageCache.set(entry.pageId, page)
+          }
+        }
+        if (shouldPruneRecord(record, page)) {
+          if (!maintenanceHasTime(deadline)) break
+          await collection.delete(record.id)
+          deleted++
+        }
+        processed++
+      }
+      if (deleted > 0) invalidateSitemapCache()
+
+      const reachedEnd = processed === records.length && records.length < RECONCILE_BATCH_SIZE
+      const next = reachedEnd ? 0 : cursor + processed - deleted
+      if (next !== cursor) await saveReconcileCursor(stateCollection, next)
+    }
+  } catch (err) {
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('sitemap reconcile error:', err instanceof Error ? err.message : String(err))
+    }
+  }
+  if (!maintenanceHasTime(deadline)) return
+
+  try {
+    await (tickPro as unknown as (
+      api: ServerPluginApi,
+      deadline: MaintenanceDeadline,
+    ) => Promise<void>)(api, deadline)
+  } catch (err) {
+    // Same shape as every other stage: a deliberate deadline stop is normal
+    // control flow, not an error, and logging the sentinel here would print
+    // "[object Object]" on every busy tick.
+    if (err !== MAINTENANCE_DEADLINE_REACHED) {
+      api.plugin.log('pro tick error:', err instanceof Error ? err.message : String(err))
+    }
+  }
 }
 
 const mod: ServerPluginModule = {
   activate(api) {
     // ── publish.html — bake SEO meta into every published page's <head> ──
     api.cms.hooks.filter('publish.html', async (html, { siteId, pageId, slug }) => {
+      // Round-5 wave-2 O#1: the hand-off slot describes ONE render, and
+      // this filter is the start of that render. Clear it FIRST so a
+      // filter that throws (or a template render, which never stashes)
+      // cannot leave a previous render's facts for this render's
+      // publish.after to consume as fresh. See clearPageStash.
+      if (typeof pageId === 'string' && pageId !== '') clearPageStash(pageId)
       try {
         const config = await loadSeoConfig(seoConfigCollection(api))
         // BLOCKER GUARD: when pageId is a TEMPLATE page, this render is a
@@ -577,6 +1020,18 @@ const mod: ServerPluginModule = {
         // A publish must never break on SEO decoration: any unexpected
         // failure (storage hiccup, malformed stored data) passes the
         // document through untouched.
+        //
+        // But it must not be INVISIBLE either (review finding,
+        // 2026-08-15): before this, a page could publish with every meta
+        // tag, JSON-LD block and analytics tag silently missing, and
+        // nothing anywhere said so. The filter cannot write (it is
+        // strictly read-only — G10), so record it in the same in-memory
+        // stash the sitemap facts use and let publish.after persist it.
+        try {
+          stashDecorationFailure(pageId)
+        } catch {
+          // Reporting a failure must never itself break a publish.
+        }
         return html
       }
     })
@@ -618,7 +1073,11 @@ const mod: ServerPluginModule = {
       const ref = parseEntryRef(req.url)
       if (!ref.ok) return badRequest(ref.errors)
 
-      const parsed = parseJsonBody(await req.text())
+      const raw = await req.text()
+      if (!isSeoMetaRequestBodyWithinLimit(raw)) {
+        return badRequest([{ field: '', message: 'request body too large' }])
+      }
+      const parsed = parseJsonBody(raw)
       if (!parsed.ok) return badRequest(parsed.errors)
 
       const validated = validateSeoMeta(parsed.value)
@@ -644,11 +1103,29 @@ const mod: ServerPluginModule = {
       const ref = parseEntryRef(req.url)
       if (!ref.ok) return badRequest(ref.errors)
 
-      const records = await listSeoMetaRecords(api, seoMetaKey(ref.tableSlug, ref.entryId))
-      for (const record of records) {
-        await seoMetaCollection(api).delete(record.id)
+      // DELETE means GONE. `listSeoMetaRecords` is capped at 100, so a key
+      // that accumulated more duplicates than that (G10 has no unique
+      // key, so nothing bounds them) would leave survivors behind — and
+      // the next newest-wins READ would resurrect the metadata the user
+      // just deleted. Sweep in passes until a list comes back empty
+      // (review finding, 2026-08-15).
+      const key = seoMetaKey(ref.tableSlug, ref.entryId)
+      let deleted = 0
+      for (let pass = 0; pass < META_DELETE_MAX_PASSES; pass++) {
+        const records = await listSeoMetaRecords(api, key)
+        if (records.length === 0) break
+        for (const record of records) {
+          await seoMetaCollection(api).delete(record.id)
+          deleted++
+        }
       }
-      return {}
+      // If anything could still be there, say so rather than reporting a
+      // clean delete: an honest partial beats a silent one.
+      // There is no transaction or compare-and-set at this host pin. A POST
+      // can still create a record after this final read, so `complete` only
+      // reports the state observed by DELETE, not a future guarantee.
+      const remaining = (await listSeoMetaRecords(api, key)).length
+      return { deleted, remaining, complete: remaining === 0 }
     })
 
     // ── task 2.6: analytics stats read (authenticated, dashboard widget) ─
@@ -691,11 +1168,53 @@ const mod: ServerPluginModule = {
       // Duplicate cleanup lives HERE (authenticated, capped), never on
       // the publish filter path (loadSeoConfig is read-only).
       await healSeoConfigDuplicates(seoConfigCollection(api))
-      return await loadSeoConfig(seoConfigCollection(api))
+      const config = await loadSeoConfig(seoConfigCollection(api))
+      // Review 2026-08-15: a publish whose decoration threw shipped a page
+      // with NO SEO tags and said nothing. Ride the settings load so the
+      // admin can warn without another round-trip. Read-only and
+      // best-effort — a reporting failure must not break settings.
+      let decorationFailures: { count: number; lastAt?: string; pages: string[] } | undefined
+      let indexNowFailure: { lastAt?: string; status: string } | undefined
+      try {
+        const state = await loadDecorationFailure(seoStateCollection(api))
+        if (state.failureCount > 0) {
+          decorationFailures = {
+            count: state.failureCount,
+            ...(state.lastFailureAt !== undefined ? { lastAt: state.lastFailureAt } : {}),
+            pages: state.failurePages,
+          }
+        }
+      } catch {
+        // no warning is better than no settings page
+      }
+      try {
+        const state = await loadIndexNowState(
+          seoStateCollection(api),
+          seoConfigCollection(api),
+          { migrate: false },
+        )
+        if (state.lastStatus?.startsWith('error:')) {
+          indexNowFailure = {
+            status: state.lastStatus,
+            ...(state.lastSubmittedAt !== undefined ? { lastAt: state.lastSubmittedAt } : {}),
+          }
+        }
+      } catch {
+        // no warning is better than no settings page
+      }
+      return {
+        ...config,
+        ...(decorationFailures !== undefined ? { decorationFailures } : {}),
+        ...(indexNowFailure !== undefined ? { indexNowFailure } : {}),
+      }
     })
 
     api.cms.routes.authenticated.post('/config', async ({ req }) => {
-      const parsed = parseJsonBody(await req.text())
+      const raw = await req.text()
+      if (!isSeoConfigRequestBodyWithinLimit(raw)) {
+        return badRequest([{ field: '', message: 'request body too large' }])
+      }
+      const parsed = parseJsonBody(raw)
       if (!parsed.ok) return badRequest(parsed.errors)
 
       const validated = validateSeoConfig(parsed.value)
@@ -772,9 +1291,42 @@ const mod: ServerPluginModule = {
     // (planSitemapWrite compares slug/title/fingerprint), so live-render
     // traffic never generates write load. Never throws into the publish.
     api.cms.hooks.on('publish.after', async ({ pageId }) => {
+      // Persist any decoration failure the read-only filter recorded, so
+      // "this page published with no SEO tags" is visible instead of
+      // silent (review finding, 2026-08-15). Done before the sitemap work
+      // and independently of it: a page that FAILED decoration has no
+      // stash, so it would otherwise return below and never be reported.
+      // Drained BEFORE the try so the catch can put the ids back: the
+      // drain clears the module set, so a failed storage write would
+      // otherwise lose the warning for good (round 5 triage C#1).
+      const failed = takeDecorationFailures()
       try {
-        if (typeof pageId !== 'string' || pageId === '') return
-        const stash = takePageStash(pageId)
+        if (failed.length > 0) {
+          await recordDecorationFailure(
+            seoStateCollection(api),
+            failed,
+            new Date().toISOString(),
+          )
+        }
+      } catch {
+        // Reporting must never break a publish — but a transient storage
+        // failure must not silently swallow the tally either: re-stash so
+        // the next publish.after retries these ids. `stashDecorationFailure`
+        // is a capped Set, so re-adding is idempotent and still bounded.
+        // Accepted narrow window: `recordDecorationFailure` creates BEFORE
+        // it compacts (seoState.ts:441-447), so a throw from the COMPACTION
+        // re-stashes ids that were already persisted and the next retry
+        // counts them twice. Over-counting an advisory tally beats losing
+        // it, which is what this catch did before.
+        for (const id of failed) stashDecorationFailure(id)
+      }
+
+      if (typeof pageId !== 'string' || pageId === '') return
+      // Popped BEFORE any write, for the same reason as the failure set —
+      // see the catch below (round 5 triage C#2).
+      let stash: PageStash | undefined
+      try {
+        stash = takePageStash(pageId)
         if (stash === undefined) return
 
         const collection = sitemapCollection(api)
@@ -812,18 +1364,29 @@ const mod: ServerPluginModule = {
           // its own fresh eval budget.
         }
       } catch (err) {
+        // Put the hand-off back: the pop above happens before any sitemap
+        // write, so a transient storage failure would otherwise leave the
+        // sitemap/IndexNow queue stale until the page is published again.
+        // publish.after fires for bakes, republishes AND live renders
+        // (publishedHtmlPipeline.ts:66-69), so the very next one retries.
+        // Accepted cost: the retry re-runs planSitemapWrite, so a slug
+        // move observed before the failed write is recorded a second time
+        // (fire-and-forget callback, keyed by pageId+ms — sitemap.ts:317).
+        // A duplicate advisory "URL changed" row beats losing the page's
+        // sitemap entry; the moves list is capped and duplicate-tolerant.
+        if (stash !== undefined) stashPage(pageId, stash)
         api.plugin.log('sitemap tracking error:', err instanceof Error ? err.message : String(err))
       }
     })
 
-    // Page deletions prune the sitemap immediately when the host emits the
-    // event. NOTE (candidate G-item, see docs/SPIKES.md): editor-driven
-    // page deletions may bypass `content.entry.deleted` (pages are
-    // Yjs/page-tree managed), so the scheduled reconcile below is the
-    // safety net that guarantees eventual pruning either way.
+    // Page deletions prune the sitemap and page meta immediately when the
+    // host emits the event. NOTE (candidate G-item, see docs/SPIKES.md):
+    // editor-driven page deletions may bypass `content.entry.deleted`
+    // (pages are Yjs/page-tree managed), so the scheduled reconciles below
+    // are the safety net that guarantees eventual pruning either way.
     api.cms.hooks.on('content.entry.deleted', async ({ tableSlug, entryId }) => {
+      if (tableSlug !== PAGES_TABLE_SLUG || typeof entryId !== 'string') return
       try {
-        if (tableSlug !== PAGES_TABLE_SLUG || typeof entryId !== 'string') return
         const collection = sitemapCollection(api)
         const records = await listSitemapRecordsForKey(collection, sitemapPageKey(entryId))
         for (const record of records.slice(0, SITEMAP_CLEANUP_CAP)) {
@@ -833,94 +1396,28 @@ const mod: ServerPluginModule = {
       } catch (err) {
         api.plugin.log('sitemap prune error:', err instanceof Error ? err.message : String(err))
       }
+      try {
+        const records = await listSeoMetaRecords(api, seoMetaKey(PAGES_TABLE_SLUG, entryId))
+        for (const record of records.slice(0, SEO_META_CLEANUP_CAP)) {
+          await seoMetaCollection(api).delete(record.id)
+        }
+      } catch (err) {
+        api.plugin.log('seo-meta prune error:', err instanceof Error ? err.message : String(err))
+      }
     })
 
     // Maintenance tick (cms.schedule permission): performs ALL IndexNow
     // POSTs (review #8 — the publish path only marks records pending),
-    // then reconciles one cursor-paged batch of sitemap records against
-    // the pages table. Cursor-based (review #5): the offset persists in
-    // the server-owned seo-state collection across ticks, so ANY site
-    // size eventually reconciles fully — no fixed scan cap, no
-    // complete-listing precondition. Per record, the page row is looked
-    // up individually (`pages.get` → status + cells) and pruned when the
-    // page is gone, not `published` (published→draft reverts — review
-    // blocker #2), or a template. Deletions capped per tick; a cap-hit
-    // leaves the remainder of the batch for the wrap-around pass.
-    api.cms.schedule.every(15, 'seo-maintenance', async () => {
-      await flushIndexNow(api)
-      // Task 2.4: drain the in-memory beacon counters into the day-record
-      // collections (the ONLY place these collections are written) and
-      // prune day records past the 30-day retention window. Failures
-      // log-and-continue; a lost drain loses one interval of approximate
-      // counts (accepted, see server/analytics.ts).
-      try {
-        await flushDayCounts(pageViewCounts, analyticsCollection(api), ANALYTICS_PATH_CAP)
-        await flushDayCounts(notFoundCounts, notFoundCollection(api), NOTFOUND_PATH_CAP)
-        await pruneExpiredDayRecords(analyticsCollection(api), Date.now())
-        await pruneExpiredDayRecords(notFoundCollection(api), Date.now())
-      } catch (err) {
-        api.plugin.log('beacon flush error:', err instanceof Error ? err.message : String(err))
-      }
-      // Task 3.2 (review C3): Pro tick (license revalidation + MCP bulk
-      // jobs; no-op in free) runs BEFORE sitemap reconciliation — the
-      // reconcile block `return`s early on an empty record page, which
-      // previously skipped daily license revalidation on sites with no
-      // sitemap records.
-      try {
-        await tickPro(api)
-      } catch (err) {
-        api.plugin.log('pro tick error:', err instanceof Error ? err.message : String(err))
-      }
-      try {
-        const collection = sitemapCollection(api)
-        const stateCollection = seoStateCollection(api)
-        const pages = api.cms.content.table(PAGES_TABLE_SLUG)
-
-        const cursor = await loadReconcileCursor(stateCollection)
-        const { records } = await collection.list({
-          limit: RECONCILE_BATCH_SIZE,
-          offset: cursor,
-        })
-        if (records.length === 0) {
-          // Past the end (records deleted since the cursor was written,
-          // or a full pass completed) — wrap around.
-          if (cursor !== 0) await saveReconcileCursor(stateCollection, 0)
-          return
-        }
-
-        const pageCache = new Map<string, ReconcilePageInfo | null>()
-        let deleted = 0
-        for (const record of records) {
-          if (deleted >= SITEMAP_CLEANUP_CAP) break
-          const entry = deserializeSitemapRecord(record.data)
-          let page: ReconcilePageInfo | null = null
-          if (entry !== undefined) {
-            const cached = pageCache.get(entry.pageId)
-            if (cached !== undefined) {
-              page = cached
-            } else {
-              const row = await pages.get(entry.pageId)
-              page = row ? { status: row.status, cells: row.cells } : null
-              pageCache.set(entry.pageId, page)
-            }
-          }
-          if (shouldPruneRecord(record, page)) {
-            await collection.delete(record.id)
-            deleted++
-          }
-        }
-        if (deleted > 0) invalidateSitemapCache()
-
-        // Advance: deletions shift later records left by `deleted`, so the
-        // next unprocessed record now sits at cursor + processed - deleted.
-        // A short batch means the pass reached the end — wrap to 0.
-        const next =
-          records.length < RECONCILE_BATCH_SIZE ? 0 : cursor + records.length - deleted
-        if (next !== cursor) await saveReconcileCursor(stateCollection, next)
-      } catch (err) {
-        api.plugin.log('sitemap reconcile error:', err instanceof Error ? err.message : String(err))
-      }
-    })
+    // then reconciles cursor-paged seo-meta and sitemap batches against the
+    // pages table. Cursor-based (review #5): independent offsets persist in
+    // the server-owned seo-state collection across ticks, so ANY site size
+    // eventually reconciles fully — no fixed scan cap, no complete-listing
+    // precondition. Per record, the page row is looked up individually.
+    // Seo-meta is pruned only when the page is gone; sitemap is also pruned
+    // when the page is not `published` (published→draft reverts — review
+    // blocker #2), or a template. Deletions are capped per tick; a cap-hit
+    // leaves the remainder of each batch for the wrap-around pass.
+    api.cms.schedule.every(15, 'seo-maintenance', () => runMaintenanceTick(api))
 
     // ── task 2.2: public routes (user: null — runtime.ts:209-256) ────────
     //
@@ -1055,6 +1552,13 @@ const mod: ServerPluginModule = {
           body: JSON.stringify({ error: 'key lookup failed' }),
         }
       }
+    })
+
+    // Authenticated operator escape hatch: clear both the current and
+    // pre-migration key so the next successful flush generates a fresh one.
+    api.cms.routes.authenticated.delete(INDEXNOW_KEY_ROUTE, async () => {
+      await clearIndexNowState(seoStateCollection(api), seoConfigCollection(api))
+      return {}
     })
 
     // ── task 2.4: beacon ingest (PUBLIC, anonymous — user: null) ─────────

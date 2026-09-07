@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import {
+  SITEMAP_ENTRY_MAX_CHARS,
   SITEMAP_LIST_PAGE_SIZE,
+  SITEMAP_URL_BUDGET_CHARS,
   SITEMAP_URL_CAP,
   buildSitemapXml,
   contentFingerprint,
@@ -8,6 +10,7 @@ import {
   entriesFromRecords,
   escapeXml,
   invalidateSitemapCache,
+  isEmittableEntry,
   isValidLastmod,
   listSitemapRecordsForKey,
   loadSitemapEntries,
@@ -104,9 +107,17 @@ describe('normalizeForFingerprint (review #3 — publish-version volatility)', (
       '<p>literal ?v=5 text stays</p>'
     const normalized = normalizeForFingerprint(html)
     expect(normalized).toContain('<a href="/page">')
-    expect(normalized).toContain('<img src="/i.png">')
+    expect(normalized).toContain('<img src="/i.png?x=1">')
     expect(normalized).toContain('<div>t</div>')
     expect(normalized).toContain('literal ?v=5 text stays')
+  })
+
+  test('preserves query parameters around the publish version stamp', () => {
+    const normalized = normalizeForFingerprint(
+      '<img src="/i.png?x=1&v=9&y=2#hero"><a href="/page?x=1&v=3">x</a>',
+    )
+    expect(normalized).toContain('<img src="/i.png?x=1&y=2#hero">')
+    expect(normalized).toContain('<a href="/page?x=1">')
   })
 })
 
@@ -274,6 +285,94 @@ describe('buildSitemapXml', () => {
       SITE,
     )
     expect(xml).not.toContain('<lastmod>')
+  })
+
+  // Round-5 triage E/t2-13: per-entry length cap at the emission boundary.
+  test('skips entries whose slug exceeds the per-entry bound, LOUDLY', () => {
+    const xml = buildSitemapXml(
+      [
+        { pageId: 'p1', slug: 'ok' },
+        { pageId: 'p2', slug: 'x'.repeat(SITEMAP_ENTRY_MAX_CHARS + 1) },
+      ],
+      SITE,
+    )
+    expect(xml.match(/<url>/g)?.length).toBe(1)
+    expect(xml).toContain('<loc>https://example.com/ok</loc>')
+    expect(xml).not.toContain('xxxxxxxxxx')
+    expect(xml).toContain(
+      `<!-- skipped: 1 entry with a slug longer than ${SITEMAP_ENTRY_MAX_CHARS} characters -->`,
+    )
+  })
+
+  test('a slug exactly at the bound is still emitted', () => {
+    const slug = 'y'.repeat(SITEMAP_ENTRY_MAX_CHARS)
+    const xml = buildSitemapXml([{ pageId: 'p1', slug }], SITE, { entryMaxChars: SITEMAP_ENTRY_MAX_CHARS })
+    expect(xml).toContain(`<loc>https://example.com/${slug}</loc>`)
+    expect(xml).not.toContain('<!-- skipped:')
+  })
+
+  test('the bound keeps the document bounded under a pathological entry set', () => {
+    const entries: SitemapEntry[] = []
+    for (let i = 0; i < 50; i++) entries.push({ pageId: `p${i}`, slug: 'z'.repeat(50_000) })
+    const xml = buildSitemapXml(entries, SITE)
+    expect(xml.length).toBeLessThan(1000)
+    expect(xml).toContain('<!-- skipped: 50 entries with a slug longer than 2000 characters -->')
+  })
+
+  test('SITEMAP_ENTRY_MAX_CHARS is the documented 2000-char bound', () => {
+    expect(SITEMAP_ENTRY_MAX_CHARS).toBe(2000)
+    expect(isEmittableEntry({ pageId: 'p', slug: 'a' })).toBe(true)
+    expect(isEmittableEntry({ pageId: 'p', slug: 'a'.repeat(2001) })).toBe(false)
+  })
+
+  // ── round-5 wave-2 O#4: AGGREGATE encoded-output budget ────────────────
+
+  test('the aggregate URL budget stops the map and says so', () => {
+    const entries: SitemapEntry[] = []
+    for (let i = 0; i < 10; i++) entries.push({ pageId: `p${i}`, slug: `page-${i}` })
+    // https://example.com/page-N = 30 chars → 3 fit in 95, the 4th does not.
+    const xml = buildSitemapXml(entries, SITE, { urlBudgetChars: 95 })
+    expect(xml.match(/<url>/g)?.length).toBe(3)
+    expect(xml).toContain('<!-- skipped: 7 entries past the 95-character total URL budget -->')
+  })
+
+  test('over-budget output is independent of storage order', () => {
+    const entries: SitemapEntry[] = [
+      { pageId: 'p4', slug: 'delta' },
+      { pageId: 'p2', slug: 'bravo' },
+      { pageId: 'p3', slug: 'charlie' },
+      { pageId: 'p1', slug: 'alpha' },
+    ]
+    const options = { urlBudgetChars: 52 }
+
+    const forward = buildSitemapXml(entries, SITE, options)
+    const reversed = buildSitemapXml([...entries].reverse(), SITE, options)
+
+    expect(forward).toBe(reversed)
+    expect(forward).toContain('<loc>https://example.com/alpha</loc>')
+    expect(forward).toContain('<loc>https://example.com/bravo</loc>')
+  })
+
+  test('a document inside the budget carries no budget comment', () => {
+    const xml = buildSitemapXml([{ pageId: 'p1', slug: 'ok' }], SITE, { urlBudgetChars: 95 })
+    expect(xml).toContain('<loc>https://example.com/ok</loc>')
+    expect(xml).not.toContain('total URL budget')
+  })
+
+  test('percent-encoding expansion cannot blow the heap: 5000 max-length CJK slugs', () => {
+    // Each character percent-encodes to 9 chars, so every slug maps to
+    // ~18,000 characters: the unbudgeted map built ~90M characters
+    // (~180 MB) before the URL cap ever sliced anything.
+    const slug = '你'.repeat(SITEMAP_ENTRY_MAX_CHARS)
+    const entries: SitemapEntry[] = []
+    for (let i = 0; i < 5000; i++) entries.push({ pageId: `p${i}`, slug })
+    const started = Date.now()
+    const xml = buildSitemapXml(entries, SITE)
+    const elapsed = Date.now() - started
+    // Everything retained fits the budget, plus the XML scaffolding.
+    expect(xml.length).toBeLessThan(SITEMAP_URL_BUDGET_CHARS * 2)
+    expect(xml).toContain('total URL budget -->')
+    expect(elapsed).toBeLessThan(2000)
   })
 })
 

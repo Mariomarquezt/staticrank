@@ -106,6 +106,30 @@ function textToHtml(value: string): string {
   return escapeHtml(value).replace(/\r\n|\r|\n/g, '<br>')
 }
 
+/**
+ * Clamp a RAW prop value to what could still fit in `budget` output
+ * characters, BEFORE escaping allocates (round-5 wave-2 O#3).
+ *
+ * `SERIALIZED_HTML_MAX` is charged against the ESCAPED string, so it only
+ * bounds what is kept — not what is built. Escaping is monotonic (every
+ * source character costs at least one output character: `"` costs six,
+ * `&` five, a newline four through `textToHtml`), so a raw value longer
+ * than the remaining budget can never be emitted no matter what it
+ * contains. Without this clamp a 50 MB `base.text` node materialized
+ * ~250 MB of intermediate string inside `escapeHtml` before `charge`
+ * rejected it — the editor froze or OOMed instead of returning a
+ * truncated analysis.
+ *
+ * `budget + 1` is deliberate: it keeps the clamped value strictly longer
+ * than the budget whenever the original was, so `charge` still rejects
+ * exactly the same inputs it rejected before. Values that fit are
+ * untouched, so every non-pathological tree serializes byte-identically.
+ */
+function clampRaw(value: string, budget: number): string {
+  const limit = budget + 1
+  return value.length > limit ? value.slice(0, limit) : value
+}
+
 // ---------------------------------------------------------------------------
 // base.text tag normalization (mirror of src/modules/base/text/tags.ts)
 // ---------------------------------------------------------------------------
@@ -139,24 +163,81 @@ function stringProp(props: Record<string, unknown> | undefined, key: string): st
   return typeof value === 'string' ? value : ''
 }
 
-/** Non-empty-line split for base.list items (items.ts parity). */
-function splitListItems(raw: string): string[] {
-  return raw
-    .split('\n')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-}
-
 /** Structural modules whose children are plain page content. */
 const RECURSE_MODULES = new Set(['base.body', 'base.container', 'base.slot-instance'])
 
 /** Known leaf modules that legitimately contribute no analyzable text. */
 const SILENT_LEAF_MODULES = new Set(['base.svg', 'base.video', 'base.slot-outlet'])
 
+/**
+ * Output ceiling, in characters (~256 KB). The editor panel re-serializes
+ * and re-analyzes the whole tree on the analysis key (SeoPanel's debounced
+ * effect), so an unbounded serialization turns one multi-megabyte text or
+ * data-URI prop into a per-keystroke stall. Everything past the ceiling is
+ * dropped and reported as a skipped section — the analysis stays scored on
+ * what IS analyzable, exactly like the VC/loop skips.
+ *
+ * 256 KB is far above any hand-authored page (the largest real trees
+ * serialize in the low tens of KB) and far below the size where the
+ * extractor's linear scan becomes noticeable.
+ */
+export const SERIALIZED_HTML_MAX = 256 * 1024
+
+/**
+ * Recursion depth bound. `visited` bounds total WORK (each node once) but
+ * not DEPTH — a thousands-deep container chain (imported or hand-crafted)
+ * would throw RangeError and kill content analysis outright. Bail past the
+ * bound and count it instead; 256 is orders of magnitude deeper than any
+ * authored layout.
+ */
+export const SERIALIZE_DEPTH_MAX = 256
+
+/**
+ * URL attribute ceiling — the server's own `URL_MAX` (server/seoMeta.ts).
+ * A longer value is not storable meta anywhere in the product, so keeping
+ * it verbatim in the analysis HTML only costs memory.
+ */
+const URL_ATTR_MAX = 2000
+
+/** `data:` URI test — leading whitespace and case are both tolerated. */
+function isDataUri(value: string): boolean {
+  return /^\s*data:/i.test(value)
+}
+
+/** URL attribute value, length-bounded (see URL_ATTR_MAX). */
+function boundedUrl(value: string): string {
+  return value.length > URL_ATTR_MAX ? value.slice(0, URL_ATTR_MAX) : value
+}
+
 interface SerializeState {
   visited: Set<string>
   /** Sections whose content cannot be analyzed from the tree (VC/loop/unknown). */
   skippedCount: number
+  /** Characters still available before SERIALIZED_HTML_MAX is reached. */
+  remaining: number
+  /** True once the ceiling or the depth bound stopped serialization. */
+  truncated: boolean
+  /** Current recursion depth (see SERIALIZE_DEPTH_MAX). */
+  depth: number
+}
+
+/**
+ * Charge `cost` characters against the output ceiling. Returns false when
+ * the ceiling is reached — the caller emits nothing, serialization stops,
+ * and the cut counts as ONE skipped section (everything after it).
+ *
+ * Each node charges only what IT adds; children have already paid for
+ * their own output by the time a wrapper charges its tags.
+ */
+function charge(state: SerializeState, cost: number): boolean {
+  if (state.truncated) return false
+  if (cost > state.remaining) {
+    state.truncated = true
+    state.skippedCount += 1
+    return false
+  }
+  state.remaining -= cost
+  return true
 }
 
 function serializeChildren(
@@ -165,7 +246,9 @@ function serializeChildren(
   state: SerializeState,
 ): string {
   const inner: string[] = []
+  state.depth += 1
   for (const childId of children) serializeNode(tree, childId, state, inner)
+  state.depth -= 1
   return inner.join('')
 }
 
@@ -175,6 +258,14 @@ function serializeNode(
   state: SerializeState,
   out: string[],
 ): void {
+  // Ceiling reached earlier in the walk — stop, do not keep building.
+  if (state.truncated) return
+  // Depth bound BEFORE the visited mark: a node bailed for depth may still
+  // be reachable (and serializable) on a shallower path.
+  if (state.depth > SERIALIZE_DEPTH_MAX) {
+    state.skippedCount += 1
+    return
+  }
   // Cycle / duplicate guard: a corrupt tree must never loop the panel.
   if (state.visited.has(nodeId)) return
   state.visited.add(nodeId)
@@ -185,45 +276,83 @@ function serializeNode(
 
   switch (node.moduleId) {
     case 'base.text': {
-      const text = stringProp(props, 'text')
+      // Clamped to the remaining budget BEFORE escaping — see clampRaw.
+      const text = clampRaw(stringProp(props, 'text'), state.remaining)
       if (text === '') return
       const tag = normalizeTextTag(props?.tag)
       if (tag === 'none') {
         // Publisher parity (text/index.ts:75-79): a no-wrapper text node
         // emits the escaped text VERBATIM — no invented boundary, so
         // adjacent bare nodes concatenate exactly like the published DOM.
-        out.push(escapeHtml(text))
+        const bare = escapeHtml(text)
+        if (!charge(state, bare.length)) return
+        out.push(bare)
         return
       }
-      out.push(`<${tag}>${textToHtml(text)}</${tag}>`)
+      const html = `<${tag}>${textToHtml(text)}</${tag}>`
+      if (!charge(state, html.length)) return
+      out.push(html)
       return
     }
     case 'base.list': {
-      const items = splitListItems(stringProp(props, 'items'))
-      if (items.length === 0) return
       const tag = props?.listType === 'ordered' ? 'ol' : 'ul'
-      out.push(`<${tag}>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</${tag}>`)
+      // Scan non-empty raw lines incrementally instead of splitting or
+      // clamping the whole blob. Blank lines and trim-only content cost no
+      // HTML, so raw length cannot predict whether the serialized list fits.
+      // `/[^\n]+/g` also skips arbitrarily long newline runs without
+      // allocating one array entry per authored line.
+      const rawItems = stringProp(props, 'items')
+      const lines = rawItems.matchAll(/[^\n]+/g)
+      const parts: string[] = []
+      let cost = `<${tag}>`.length + `</${tag}>`.length
+      for (const line of lines) {
+        const item = line[0].trim()
+        if (item === '') continue
+        const li = `<li>${escapeHtml(clampRaw(item, state.remaining))}</li>`
+        parts.push(li)
+        cost += li.length
+        // The list is charged as a whole. Once its predicted cost is over
+        // budget it cannot emit, so scanning or escaping later lines cannot
+        // change the result.
+        if (cost > state.remaining) break
+      }
+      if (parts.length === 0) return
+      const html = `<${tag}>${parts.join('')}</${tag}>`
+      if (!charge(state, html.length)) return
+      out.push(html)
       return
     }
     case 'base.link': {
       // Children-first, exactly like the renderer's linkUsesChildren guard
       // (link/index.ts): props.text is the fallback when no children render.
-      const href = stringProp(props, 'href')
+      const href = escapeHtml(boundedUrl(stringProp(props, 'href')))
       const inner = serializeChildren(tree, node.children ?? [], state)
-      const content = inner !== '' ? inner : textToHtml(stringProp(props, 'text'))
+      // `inner` already paid for itself — charge only the wrapper plus the
+      // fallback text when no child rendered.
+      const fallback =
+        inner !== '' ? '' : textToHtml(clampRaw(stringProp(props, 'text'), state.remaining))
+      const content = inner !== '' ? inner : fallback
       if (href === '' && content === '') return
-      out.push(`<a href="${escapeHtml(href)}">${content}</a>`)
+      const open = `<a href="${href}">`
+      if (!charge(state, open.length + fallback.length + '</a>'.length)) {
+        // The ceiling hit on the wrapper: keep the children's already-paid
+        // content rather than throwing away analyzable text.
+        if (inner !== '') out.push(inner)
+        return
+      }
+      out.push(`${open}${content}</a>`)
       return
     }
     case 'base.button': {
-      const label = stringProp(props, 'label')
+      const label = clampRaw(stringProp(props, 'label'), state.remaining)
       const href = stringProp(props, 'href')
       if (label === '') return
-      if (href !== '') {
-        out.push(`<a href="${escapeHtml(href)}">${textToHtml(label)}</a>`)
-      } else {
-        out.push(`<span>${textToHtml(label)}</span>`)
-      }
+      const html =
+        href !== ''
+          ? `<a href="${escapeHtml(boundedUrl(href))}">${textToHtml(label)}</a>`
+          : `<span>${textToHtml(label)}</span>`
+      if (!charge(state, html.length)) return
+      out.push(html)
       return
     }
     case 'base.image': {
@@ -232,7 +361,14 @@ function serializeNode(
       // NOTE: no alt on purpose — alt lives in the media library, not the
       // tree; analysisView treats it as unknowable for this source.
       if (src === '') return
-      out.push(`<img src="${escapeHtml(src)}">`)
+      // A `data:` src is an inlined payload — potentially megabytes — with
+      // ZERO analyzable value (the extractor only counts <img> tags and
+      // reads `alt`), and the publish sanitizer rejects data: URIs anyway.
+      // Emit the tag WITHOUT the src so the image still counts, and drop
+      // the blob. Non-data srcs are length-bounded at URL_MAX.
+      const html = isDataUri(src) ? '<img>' : `<img src="${escapeHtml(boundedUrl(src))}">`
+      if (!charge(state, html.length)) return
+      out.push(html)
       return
     }
     case 'base.visual-component-ref': {
@@ -242,7 +378,12 @@ function serializeNode(
       // nodes (slotInstance/index.ts:1-18), so the slot FILLS analyze.
       state.skippedCount += 1
       const inner = serializeChildren(tree, node.children ?? [], state)
-      if (inner !== '') out.push(`<div>${inner}</div>`)
+      if (inner === '') return
+      if (!charge(state, '<div></div>'.length)) {
+        out.push(inner)
+        return
+      }
+      out.push(`<div>${inner}</div>`)
       return
     }
     case 'base.loop': {
@@ -255,7 +396,12 @@ function serializeNode(
     default: {
       if (RECURSE_MODULES.has(node.moduleId)) {
         const inner = serializeChildren(tree, node.children ?? [], state)
-        if (inner !== '') out.push(`<div>${inner}</div>`)
+        if (inner === '') return
+        if (!charge(state, '<div></div>'.length)) {
+          out.push(inner)
+          return
+        }
+        out.push(`<div>${inner}</div>`)
         return
       }
       // Unknown modules: the publisher drops them (renderNode.ts:307-310),
@@ -288,12 +434,25 @@ export interface SerializedPageContent {
  * not representable from the tree (see the module header) — content
  * checks stay scored on what IS analyzable; the view renders an explicit
  * note instead of blanket-na.
+ *
+ * BOUNDED BY CONSTRUCTION (round-5 t4-37): output stops at
+ * `SERIALIZED_HTML_MAX` characters and recursion stops at
+ * `SERIALIZE_DEPTH_MAX` levels; each cut counts as one skipped section, so
+ * a pathological tree degrades to a partial analysis instead of stalling
+ * the panel or throwing RangeError. `data:` image srcs are dropped from
+ * the emitted `<img>` (the tag — and therefore the image count — stays).
  */
 export function serializePageContent(tree: ContentTree): SerializedPageContent | null {
   if (typeof tree.rootNodeId !== 'string' || tree.nodes[tree.rootNodeId] === undefined) {
     return null
   }
-  const state: SerializeState = { visited: new Set(), skippedCount: 0 }
+  const state: SerializeState = {
+    visited: new Set(),
+    skippedCount: 0,
+    remaining: SERIALIZED_HTML_MAX,
+    truncated: false,
+    depth: 0,
+  }
   const out: string[] = []
   serializeNode(tree, tree.rootNodeId, state, out)
   return { html: out.join(''), partial: state.skippedCount > 0, skippedCount: state.skippedCount }

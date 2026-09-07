@@ -4,8 +4,16 @@ import {
   INDEXNOW_CONFIG_KEY,
   indexNowEnabled,
   MAX_CLEANUP_DELETES,
+  PUBLISHER_NAME_MAX,
+  CONFIG_TABLES_MAX,
   SEO_CONFIG_CACHE_TTL_MS,
+  SEO_CONFIG_REQUEST_BODY_MAX,
+  SEPARATOR_MAX,
+  SITE_NAME_MAX,
+  TITLE_TEMPLATE_MAX,
+  VERIFICATION_TOKEN_MAX,
   SITE_CONFIG_KEY,
+  SAME_AS_MAX,
   TABLE_CONFIG_KEY_PREFIX,
   deserializeSeoConfigRecords,
   healSeoConfigDuplicates,
@@ -18,12 +26,65 @@ import {
   type SeoConfigCollectionLike,
   type SeoConfigData,
   type StoredRecordLike,
+  isSeoConfigRequestBodyWithinLimit,
 } from '../seoConfig'
+import { DESCRIPTION_MAX, URL_MAX } from '../seoMeta'
 
 function errorFields(input: unknown): string[] {
   const result = validateSeoConfig(input)
   if (result.ok) throw new Error('expected validation to fail')
   return result.errors.map((e) => e.field)
+}
+
+function maxAbsoluteUrl(): string {
+  const prefix = 'https://a/'
+  return `${prefix}${'x'.repeat(URL_MAX - prefix.length)}`
+}
+
+function maxVerificationInput(): string {
+  const prefix = '<meta content="'
+  const suffix = '">'
+  const token = 'x'.repeat(VERIFICATION_TOKEN_MAX)
+  return `${prefix}${token}${suffix}${'x'.repeat(URL_MAX - prefix.length - token.length - suffix.length)}`
+}
+
+function maxTitleTemplate(): string {
+  const prefix = '%title%'
+  return `${prefix}${'x'.repeat(TITLE_TEMPLATE_MAX - prefix.length)}`
+}
+
+function maxSeoConfigPayload(): SeoConfigData {
+  const url = maxAbsoluteUrl()
+  const tables = Object.fromEntries(
+    Array.from({ length: CONFIG_TABLES_MAX }, (_, index) => [
+      `table${index}`,
+      { titleTemplate: maxTitleTemplate() },
+    ]),
+  )
+  return {
+    site: {
+      siteName: 'x'.repeat(SITE_NAME_MAX),
+      separator: 'x'.repeat(SEPARATOR_MAX),
+      siteUrl: 'https://example.com',
+      titleTemplate: maxTitleTemplate(),
+      metaDescription: 'x'.repeat(DESCRIPTION_MAX),
+    },
+    tables,
+    indexNow: { enabled: false },
+    schema: {
+      enabled: false,
+      publisherKind: 'organization',
+      publisherName: 'x'.repeat(PUBLISHER_NAME_MAX),
+      publisherLogoUrl: `/${'x'.repeat(URL_MAX - 1)}`,
+      sameAs: Array.from({ length: SAME_AS_MAX }, () => url),
+    },
+    analytics: { enabled: true },
+    verification: {
+      google: maxVerificationInput(),
+      bing: maxVerificationInput(),
+      pinterest: maxVerificationInput(),
+    },
+  }
 }
 
 describe('validateSeoConfig', () => {
@@ -116,9 +177,25 @@ describe('validateSeoConfig', () => {
   })
 })
 
+describe('POST /config request-body contract', () => {
+  test('accepts a payload at every validator field cap and rejects an oversize body', () => {
+    const payload = maxSeoConfigPayload()
+    const validated = validateSeoConfig(payload)
+    expect(validated.ok).toBe(true)
+
+    const raw = JSON.stringify(payload)
+    expect(raw.length).toBeLessThanOrEqual(SEO_CONFIG_REQUEST_BODY_MAX)
+    expect(isSeoConfigRequestBodyWithinLimit(raw)).toBe(true)
+
+    const oversize = `${raw}${' '.repeat(SEO_CONFIG_REQUEST_BODY_MAX - raw.length + 1)}`
+    expect(isSeoConfigRequestBodyWithinLimit(oversize)).toBe(false)
+  })
+})
+
 describe('serialize / deserialize round-trip', () => {
   test('splits into one record per key and round-trips exactly', () => {
     const config: SeoConfigData = {
+      version: 1,
       site: { siteName: 'Acme', siteUrl: 'https://example.com' },
       tables: { posts: { titleTemplate: '%title%' }, docs: { titleTemplate: '%slug%' } },
     }
@@ -145,6 +222,64 @@ describe('serialize / deserialize round-trip', () => {
       site: { siteName: 'First' },
       tables: { docs: { titleTemplate: '%title%' } },
     })
+  })
+
+  test('read validation trims and drops forged site/table fields', () => {
+    expect(
+      deserializeSeoConfigRecords([
+        {
+          key: SITE_CONFIG_KEY,
+          version: 1,
+          siteName: '  Acme  ',
+          separator: ' | ',
+          siteUrl: ' https://example.com/ ',
+          titleTemplate: ' %title% %sep% ',
+          metaDescription: '  Description  ',
+        },
+        {
+          key: `${TABLE_CONFIG_KEY_PREFIX}posts`,
+          version: 1,
+          titleTemplate: '%bogus%',
+        },
+      ]),
+    ).toEqual({
+      version: 1,
+      site: {
+        siteName: 'Acme',
+        separator: '|',
+        siteUrl: 'https://example.com',
+        titleTemplate: '%title% %sep%',
+        metaDescription: 'Description',
+      },
+    })
+  })
+
+  test('versioned toggles fail closed when their records are partial', () => {
+    const config = deserializeSeoConfigRecords([
+      { key: SITE_CONFIG_KEY, version: 1, siteName: 'Acme' },
+      { key: INDEXNOW_CONFIG_KEY, version: 1 },
+      { key: SCHEMA_CONFIG_KEY, version: 1 },
+    ])
+    expect(indexNowEnabled(config)).toBe(false)
+    expect(schemaEnabled(config)).toBe(false)
+    expect(deserializeSeoConfigRecords([{ key: SITE_CONFIG_KEY, version: 99 }]).version).toBe(0)
+  })
+
+  test('BLOCKER regression: upgrading a legacy site-name save preserves both default-ON toggles', () => {
+    const legacy = { site: { siteName: 'Acme' } }
+    expect(indexNowEnabled(legacy)).toBe(true)
+    expect(schemaEnabled(legacy)).toBe(true)
+
+    const upgradedRecords = serializeSeoConfig({ site: { siteName: 'Acme 2' } })
+    const upgraded = deserializeSeoConfigRecords(upgradedRecords)
+
+    expect(upgradedRecords).toEqual([
+      { key: SITE_CONFIG_KEY, version: 1, siteName: 'Acme 2' },
+      { key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: true },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: true },
+    ])
+    expect(indexNowEnabled(upgraded)).toBe(true)
+    expect(schemaEnabled(upgraded)).toBe(true)
   })
 })
 
@@ -296,9 +431,13 @@ describe('planSeoConfigReplace', () => {
     expect(plan.ok).toBe(true)
     if (!plan.ok) return
     expect(plan.updates).toEqual([
-      { recordId: 'site-new', data: { key: 'site', siteName: 'Acme' } },
+      { recordId: 'site-new', data: { key: 'site', version: 1, siteName: 'Acme' } },
     ])
-    expect(plan.creates).toEqual([{ key: 'table:posts', titleTemplate: '%title%' }])
+    expect(plan.creates).toEqual([
+      { key: 'table:posts', version: 1, titleTemplate: '%title%' },
+      { key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: true },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: true },
+    ])
     expect(plan.deletes.sort()).toEqual(['junk', 'removed', 'site-old'])
   })
 
@@ -340,10 +479,10 @@ describe('validateSeoConfig — indexNow (toggle only, review #9)', () => {
     if (result.ok) expect(result.value).toEqual(config)
   })
 
-  test('enabled: true normalizes away (absent = enabled)', () => {
+  test('enabled: true is preserved for versioned fail-closed configs', () => {
     const result = validateSeoConfig({ indexNow: { enabled: true } })
     expect(result.ok).toBe(true)
-    if (result.ok) expect(result.value).toEqual({})
+    if (result.ok) expect(result.value).toEqual({ indexNow: { enabled: true } })
   })
 
   test('server-owned fields are REJECTED here — they live in seo-state now', () => {
@@ -373,13 +512,22 @@ describe('serialize/deserialize — indexNow record (toggle only)', () => {
   test('round-trips the disabled toggle through the flat `indexnow` record', () => {
     const config: SeoConfigData = { indexNow: { enabled: false } }
     const records = serializeSeoConfig(config)
-    expect(records).toEqual([{ key: INDEXNOW_CONFIG_KEY, indexNowEnabled: false }])
-    expect(deserializeSeoConfigRecords(records)).toEqual(config)
+    expect(records).toEqual([
+      { key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: false },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: true },
+    ])
+    expect(deserializeSeoConfigRecords(records)).toEqual({
+      ...config,
+      schema: { enabled: true },
+      version: 1,
+    })
   })
 
-  test('enabled (default) emits no record at all', () => {
+  test('legacy default-ON toggles are materialized during upgrade', () => {
     expect(serializeSeoConfig({ site: { siteName: 'Acme' } })).toEqual([
-      { key: SITE_CONFIG_KEY, siteName: 'Acme' },
+      { key: SITE_CONFIG_KEY, version: 1, siteName: 'Acme' },
+      { key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: true },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: true },
     ])
   })
 
@@ -404,7 +552,11 @@ describe('serialize/deserialize — indexNow record (toggle only)', () => {
       tables: { posts: { titleTemplate: '%title%' } },
       indexNow: { enabled: false },
     }
-    expect(deserializeSeoConfigRecords(serializeSeoConfig(config))).toEqual(config)
+    expect(deserializeSeoConfigRecords(serializeSeoConfig(config))).toEqual({
+      ...config,
+      schema: { enabled: true },
+      version: 1,
+    })
   })
 })
 
@@ -414,8 +566,8 @@ describe('serialize/deserialize — indexNow record (toggle only)', () => {
 
 import {
   SCHEMA_CONFIG_KEY,
-  SAME_AS_MAX,
   hasExplicitConfigSection,
+  SAME_AS_JSON_MAX,
   parseStoredSameAs,
   resolveConfigSections,
   schemaEnabled,
@@ -444,10 +596,10 @@ describe('validateSeoConfig — schema section', () => {
     }
   })
 
-  test('enabled: true normalizes away (absent = enabled, default ON)', () => {
+  test('enabled: true is preserved for versioned fail-closed configs', () => {
     const result = validateSeoConfig({ schema: { enabled: true } })
     expect(result.ok).toBe(true)
-    if (result.ok) expect(result.value.schema).toBeUndefined()
+    if (result.ok) expect(result.value.schema).toEqual({ enabled: true })
     expect(schemaEnabled({})).toBe(true)
     expect(schemaEnabled({ schema: { enabled: false } })).toBe(false)
   })
@@ -503,20 +655,34 @@ describe('serialize/deserialize — schema record', () => {
       },
     }
     const records = serializeSeoConfig(config)
-    expect(records).toHaveLength(1)
-    expect(records[0]!.key).toBe(SCHEMA_CONFIG_KEY)
-    expect(records[0]!.sameAsJson).toBe('["https://x.com/jane"]')
-    expect(deserializeSeoConfigRecords(records)).toEqual(config)
+    expect(records).toHaveLength(2)
+    expect(records[0]!.key).toBe(INDEXNOW_CONFIG_KEY)
+    expect(records[1]!.key).toBe(SCHEMA_CONFIG_KEY)
+    expect(records[1]!.sameAsJson).toBe('["https://x.com/jane"]')
+    expect(deserializeSeoConfigRecords(records)).toEqual({
+      ...config,
+      indexNow: { enabled: true },
+      version: 1,
+    })
   })
 
-  test('default-ON toggle: enabled absent stores no schemaEnabled field', () => {
+  test('default-ON toggle: enabled absent is materialized during upgrade', () => {
     const records = serializeSeoConfig({ schema: { publisherName: 'Acme' } })
-    expect(records).toHaveLength(1)
-    expect('schemaEnabled' in records[0]!).toBe(false)
+    expect(records).toHaveLength(2)
+    expect(records[0]).toEqual({ key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: true })
+    expect(records[1]).toEqual({
+      key: SCHEMA_CONFIG_KEY,
+      version: 1,
+      schemaEnabled: true,
+      publisherName: 'Acme',
+    })
   })
 
-  test('an all-defaults schema section emits no record at all', () => {
-    expect(serializeSeoConfig({ schema: {} })).toEqual([])
+  test('an explicit empty schema section still carries materialized toggle values', () => {
+    expect(serializeSeoConfig({ schema: {} })).toEqual([
+      { key: INDEXNOW_CONFIG_KEY, version: 1, indexNowEnabled: true },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: true },
+    ])
   })
 
   test('malformed stored values are dropped defensively', () => {
@@ -540,6 +706,18 @@ describe('serialize/deserialize — schema record', () => {
       Array.from({ length: SAME_AS_MAX + 5 }, (_, i) => `https://a.example/${i}`),
     )
     expect(parseStoredSameAs(overflow)).toHaveLength(SAME_AS_MAX)
+  })
+
+  test('parseStoredSameAs refuses to parse an over-long raw string (round 5 wave 2 O#6a)', () => {
+    // Maximal legitimate serialization still round-trips…
+    const maximal = JSON.stringify(
+      Array.from({ length: SAME_AS_MAX }, (_, i) => `https://a.example/${'x'.repeat(1980)}${i}`),
+    )
+    expect(maximal.length).toBeLessThanOrEqual(SAME_AS_JSON_MAX)
+    expect(parseStoredSameAs(maximal)).toHaveLength(SAME_AS_MAX)
+    // …but a hand-edited multi-megabyte record is refused BEFORE JSON.parse.
+    const bloated = `["https://a.example","${'x'.repeat(SAME_AS_JSON_MAX)}"]`
+    expect(parseStoredSameAs(bloated)).toBeUndefined()
   })
 })
 
@@ -588,16 +766,15 @@ describe('resolveConfigSections — POST /config presence-first resolution', () 
   })
 
   test('BLOCKER regression: schema-only clear works when nothing else is stored', () => {
-    const raw = { schema: { enabled: true } } // all-defaults = clear
+    const raw = { schema: { enabled: true } }
     const result = validateSeoConfig(raw)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(hasExplicitConfigSection(raw)).toBe(true)
-    // Resolved document is FULLY EMPTY — still a valid write (the plan
-    // deletes the schema record), never an empty-payload 400.
+    // Explicit true is data in the versioned shape, not an implicit clear.
     expect(
       resolveConfigSections(raw, result.value, { schema: { publisherName: 'Acme' } }),
-    ).toEqual({})
+    ).toEqual({ schema: { enabled: true } })
   })
 
   test('BLOCKER regression: a body with NO explicit section keys still 400s', () => {
@@ -626,6 +803,46 @@ describe('resolveConfigSections — POST /config presence-first resolution', () 
         site: { siteName: 'Old' },
       }),
     ).toEqual(validated)
+  })
+
+  test('carries a stored version marker so versioned absent toggles stay off', () => {
+    const existingVersioned: SeoConfigData = {
+      version: 1,
+      site: { siteName: 'Old' },
+    }
+    const raw = { site: { siteName: 'New' } }
+    const validated: SeoConfigData = { site: { siteName: 'New' } }
+    const resolved = resolveConfigSections(raw, validated, existingVersioned)
+
+    expect(resolved.version).toBe(1)
+    const roundTripped = deserializeSeoConfigRecords(serializeSeoConfig(resolved))
+    expect(roundTripped).toEqual({ version: 1, site: { siteName: 'New' } })
+    expect(indexNowEnabled(roundTripped)).toBe(false)
+    expect(schemaEnabled(roundTripped)).toBe(false)
+  })
+
+  test('clearing indexNow does not materialize its legacy default on a versioned save', () => {
+    const existingVersioned: SeoConfigData = {
+      version: 1,
+      site: { siteName: 'Old' },
+      indexNow: { enabled: false },
+      schema: { enabled: false },
+    }
+    const raw = { indexNow: {} }
+    const validated = validateSeoConfig(raw)
+    expect(validated.ok).toBe(true)
+    if (!validated.ok) return
+
+    const resolved = resolveConfigSections(raw, validated.value, existingVersioned)
+    expect(resolved).toEqual({
+      version: 1,
+      site: { siteName: 'Old' },
+      schema: { enabled: false },
+    })
+    expect(serializeSeoConfig(resolved)).toEqual([
+      { key: SITE_CONFIG_KEY, version: 1, siteName: 'Old' },
+      { key: SCHEMA_CONFIG_KEY, version: 1, schemaEnabled: false },
+    ])
   })
 })
 

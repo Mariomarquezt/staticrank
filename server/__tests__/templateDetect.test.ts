@@ -91,6 +91,33 @@ describe('getTemplatePageInfo', () => {
     expect(calls.get).toBe(3)
   })
 
+  test('an expired lookup cannot populate the replacement cache generation', async () => {
+    let releaseOld!: () => void
+    const oldResult = new Promise<void>((resolve) => {
+      releaseOld = resolve
+    })
+    let calls = 0
+    const table: PagesTableLike = {
+      get: async () => {
+        calls++
+        if (calls === 1) {
+          await oldResult
+          return { cells: { templateEnabled: false } }
+        }
+        return { cells: { templateEnabled: true } }
+      },
+    }
+
+    const oldLookup = getTemplatePageInfo(table, 'page-1', 0)
+    const fresh = await getTemplatePageInfo(table, 'page-1', TEMPLATE_FLAG_CACHE_TTL_MS)
+    expect(fresh.isTemplate).toBe(true)
+    releaseOld()
+    expect((await oldLookup).isTemplate).toBe(false)
+    expect(
+      (await getTemplatePageInfo(table, 'page-1', TEMPLATE_FLAG_CACHE_TTL_MS + 1)).isTemplate,
+    ).toBe(true)
+  })
+
   test('isTemplatePageId is the boolean view', async () => {
     const { table } = fakePagesTable({ tpl: { templateEnabled: true }, page: {} })
     expect(await isTemplatePageId(table, 'tpl')).toBe(true)

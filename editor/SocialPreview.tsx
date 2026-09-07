@@ -21,6 +21,7 @@
  * other Pro teasers.
  */
 import { Stack, Text } from '@instatic/host-ui'
+import type { TwitterCard } from '../server/seoMeta'
 import { ProLock } from '../admin/ProLock'
 import { missingImageHint, resolveSocialCard, type SocialCard } from './lib/socialPreview'
 
@@ -32,6 +33,7 @@ export interface SocialPreviewProps {
   ogTitle?: string       // stored og override, if any
   ogDescription?: string
   ogImage?: string       // absolute or site-relative URL, may be empty
+  twitterCard?: TwitterCard // stored twitter:card — decides the X layout
   siteUrl: string        // bare origin ('' when unconfigured)
   slug: string
   siteName: string
@@ -145,7 +147,101 @@ function FacebookCard({ card }: { card: SocialCard }) {
   )
 }
 
+/**
+ * The small `summary` card: a square thumbnail on the left, text on the
+ * right — X's layout when `twitter:card` is stored as `summary`. Same
+ * literal-color discipline as the large card.
+ */
+function XSummaryCard({ card }: { card: SocialCard }) {
+  const side = 125
+  return (
+    <div
+      style={{
+        maxWidth: CARD_MAX_WIDTH,
+        display: 'flex',
+        border: '1px solid #cfd9de',
+        borderRadius: 16,
+        overflow: 'hidden',
+        background: '#ffffff',
+        fontFamily: 'system-ui, -apple-system, sans-serif',
+      }}
+    >
+      <div
+        style={{
+          position: 'relative',
+          width: side,
+          minWidth: side,
+          height: side,
+          background: '#e4e6eb',
+          borderRight: '1px solid #cfd9de',
+          overflow: 'hidden',
+        }}
+      >
+        {card.imageUrl !== null ? (
+          <img
+            src={card.imageUrl}
+            alt=""
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+            }}
+          />
+        ) : (
+          <div
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#8a8d91',
+              fontSize: 12,
+              textAlign: 'center',
+              padding: 8,
+              fontFamily: 'system-ui, sans-serif',
+            }}
+          >
+            No share image
+          </div>
+        )}
+      </div>
+      <div style={{ padding: '10px 12px', minWidth: 0 }}>
+        <div
+          style={{
+            color: '#536471',
+            fontSize: 13,
+            lineHeight: '17px',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {card.host !== '' ? card.host : 'example.com'}
+        </div>
+        <div style={{ color: '#0f1419', fontSize: 15, lineHeight: '19px', marginTop: 2 }}>
+          {card.xTitle}
+        </div>
+        {card.xDescription !== '' ? (
+          <div style={{ color: '#536471', fontSize: 14, lineHeight: '18px', marginTop: 2 }}>
+            {card.xDescription}
+          </div>
+        ) : (
+          <div style={{ color: '#8b98a5', fontSize: 13, lineHeight: '18px', marginTop: 2 }}>
+            No description — X may show the card without one.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function XCard({ card }: { card: SocialCard }) {
+  // The stored `twitterCard` decides the layout — a page saved as
+  // `summary` must not preview as the wide card X will never render.
+  if (card.xCard === 'summary') return <XSummaryCard card={card} />
   return (
     <div
       style={{
@@ -206,6 +302,7 @@ export function SocialPreviews(props: SocialPreviewProps): JSX.Element {
     ogTitle: props.ogTitle,
     ogDescription: props.ogDescription,
     ogImage: props.ogImage,
+    twitterCard: props.twitterCard,
     siteUrl: props.siteUrl,
   })
 

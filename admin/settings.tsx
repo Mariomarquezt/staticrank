@@ -61,11 +61,15 @@ import {
   isConfigFormDirty,
   mergeDirtyConfig,
   nextRowId,
+  parseDecorationFailures,
+  parseIndexNowFailure,
   planConfigSave,
   previewTemplate,
   serverErrorsToForm,
   validateConfigForm,
   type ConfigFormState,
+  type DecorationFailureView,
+  type IndexNowFailureView,
   type RowErrors,
   type SameAsErrors,
 } from './lib/configForm'
@@ -130,6 +134,79 @@ function rememberWizardDismissed(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Merge-after-save (round-5 t4-30 — the wave-G twin of mergeMetaFormAfterSave)
+// ---------------------------------------------------------------------------
+
+/** Row lists are ONE unit: any add/remove/edit keeps the operator's list. */
+function tableRowsChanged(
+  a: ConfigFormState['tableRows'],
+  b: ConfigFormState['tableRows'],
+): boolean {
+  return (
+    a.length !== b.length ||
+    a.some((row, index) => {
+      const other = b[index]
+      return (
+        other === undefined ||
+        row.id !== other.id ||
+        row.tableSlug !== other.tableSlug ||
+        row.titleTemplate !== other.titleTemplate
+      )
+    })
+  )
+}
+
+function sameAsRowsChanged(
+  a: ConfigFormState['sameAsRows'],
+  b: ConfigFormState['sameAsRows'],
+): boolean {
+  return (
+    a.length !== b.length ||
+    a.some((row, index) => {
+      const other = b[index]
+      return other === undefined || row.id !== other.id || row.url !== other.url
+    })
+  )
+}
+
+/**
+ * Merge a save response with edits typed WHILE that save was in flight.
+ * The form fields are never disabled during a save, so replacing the whole
+ * form with the response silently discarded anything typed after the click
+ * (round-5 t4-30). Same rule as the editor panel's `mergeMetaFormAfterSave`
+ * (admin/lib/metaForm.ts): a field that changed since the request started
+ * keeps the operator's value (and stays dirty against the new baseline, so
+ * Save re-enables); every untouched field adopts the server's normalized
+ * response. The two row lists are each ONE unit — per-row merging of an
+ * id-keyed list would invent rows nobody typed.
+ *
+ * Pure and local on purpose: the natural home is admin/lib/configForm.ts
+ * next to `mergeDirtyConfig`, which this wave does not own.
+ */
+function mergeConfigFormAfterSave(
+  nextForm: ConfigFormState,
+  savedForm: ConfigFormState,
+  currentForm: ConfigFormState,
+): ConfigFormState {
+  // Key-driven rather than field-listed so a new form field cannot be
+  // forgotten here; the two row lists are handled explicitly below.
+  const merged = { ...nextForm } as unknown as Record<string, unknown>
+  const saved = savedForm as unknown as Record<string, unknown>
+  const current = currentForm as unknown as Record<string, unknown>
+  for (const key of Object.keys(merged)) {
+    if (key === 'tableRows' || key === 'sameAsRows') continue
+    if (current[key] !== saved[key]) merged[key] = current[key]
+  }
+  if (tableRowsChanged(currentForm.tableRows, savedForm.tableRows)) {
+    merged.tableRows = currentForm.tableRows
+  }
+  if (sameAsRowsChanged(currentForm.sameAsRows, savedForm.sameAsRows)) {
+    merged.sameAsRows = currentForm.sameAsRows
+  }
+  return merged as unknown as ConfigFormState
+}
+
 /** Human line for one import-preview section change. */
 const CHANGE_LABELS: Record<SectionChange['kind'], string> = {
   added: 'will be set (currently empty)',
@@ -163,13 +240,26 @@ async function readErrors(res: Response): Promise<FieldError[]> {
   return [{ field: '', message: `request failed with ${res.status}` }]
 }
 
-async function fetchConfig(routes: RoutesLike): Promise<SeoConfigData> {
+async function fetchConfig(
+  routes: RoutesLike,
+): Promise<{
+  config: SeoConfigData
+  decorationFailures?: DecorationFailureView
+  indexNowFailure?: IndexNowFailureView
+}> {
   const res = await routes.fetch('/config')
   if (!res.ok) {
     const errors = await readErrors(res)
     throw new Error(errors[0]?.message ?? 'could not load SEO settings')
   }
-  return (await res.json()) as SeoConfigData
+  const body = await res.json()
+  const decorationFailures = parseDecorationFailures(body)
+  const indexNowFailure = parseIndexNowFailure(body)
+  return {
+    config: body as SeoConfigData,
+    ...(decorationFailures !== undefined ? { decorationFailures } : {}),
+    ...(indexNowFailure !== undefined ? { indexNowFailure } : {}),
+  }
 }
 
 type ConfigLoad =
@@ -221,6 +311,12 @@ export default function SeoSettingsApp() {
   // incomplete (no usable stored siteUrl) and not previously dismissed;
   // always revisitable via the "Setup guide" button.
   const [showWizard, setShowWizard] = useState(false)
+  /** Set when a publish shipped a page with NO SEO tags (review
+   * 2026-08-15) — previously invisible. */
+  const [decorationFailures, setDecorationFailures] = useState<DecorationFailureView | undefined>(
+    undefined,
+  )
+  const [indexNowFailure, setIndexNowFailure] = useState<IndexNowFailureView | undefined>(undefined)
   const wizardAutoShown = useRef(false)
 
   // Settings transfer (task 2.6): import preview + transfer status.
@@ -231,6 +327,8 @@ export default function SeoSettingsApp() {
   } | null>(null)
   const [transferError, setTransferError] = useState<string | null>(null)
   const [transferBusy, setTransferBusy] = useState(false)
+  /** Two-step confirm shown only when applying would discard unsaved edits. */
+  const [confirmDiscardEdits, setConfirmDiscardEdits] = useState(false)
   const [importedFlash, setImportedFlash] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -243,9 +341,11 @@ export default function SeoSettingsApp() {
     let cancelled = false
     setLoad({ kind: 'loading' })
     void fetchConfig(routesRef.current)
-      .then((stored) => {
+      .then(({ config: stored, decorationFailures, indexNowFailure }) => {
         if (cancelled) return
         setLoad({ kind: 'ready', stored })
+        setDecorationFailures(decorationFailures)
+        setIndexNowFailure(indexNowFailure)
         const loadedForm = formFromConfig(stored)
         setForm(loadedForm)
         setBaseline(loadedForm)
@@ -319,11 +419,14 @@ export default function SeoSettingsApp() {
     setSavedFlash(false)
     if (!result.ok) return false
 
+    // The form the request describes — anything typed after this point is
+    // an edit made DURING the save and must survive the response.
+    const savedForm = form
     setSaving(true)
     try {
       // 2. Refetch-before-write: merge ONLY this form's dirty entries onto
       //    the CURRENT stored document so concurrent edits survive.
-      const fresh = await fetchConfig(routesRef.current)
+      const { config: fresh } = await fetchConfig(routesRef.current)
       const merged = mergeDirtyConfig(fresh, form, baseline)
       // 3. Safety: the merged document must itself validate (e.g. the fresh
       //    document could carry pre-validation legacy data).
@@ -369,7 +472,10 @@ export default function SeoSettingsApp() {
         plan.kind === 'delete' ? {} : ((await res.json()) as SeoConfigData)
       setLoad({ kind: 'ready', stored: nextStored })
       const nextForm = formFromConfig(nextStored)
-      setForm(nextForm)
+      // Baseline = what the server now stores; the FORM keeps whatever was
+      // typed during the request (still dirty against that baseline, so
+      // Save stays available for it) — see mergeConfigFormAfterSave.
+      setForm((currentForm) => mergeConfigFormAfterSave(nextForm, savedForm, currentForm))
       setBaseline(nextForm)
       setSavedFlash(true)
       return true
@@ -393,7 +499,7 @@ export default function SeoSettingsApp() {
     setImportedFlash(false)
     setTransferBusy(true)
     try {
-      const fresh = await fetchConfig(routesRef.current)
+      const { config: fresh } = await fetchConfig(routesRef.current)
       const text = serializeConfigExport(
         buildConfigExport(fresh, pluginVersion, new Date().toISOString()),
       )
@@ -420,6 +526,7 @@ export default function SeoSettingsApp() {
     setTransferError(null)
     setImportedFlash(false)
     setImportPreview(null)
+    setConfirmDiscardEdits(false)
     // Size gate BEFORE reading the file into memory (review C#5).
     if (importFileTooLarge(file.size)) {
       setTransferError(IMPORT_FILE_TOO_LARGE_MESSAGE)
@@ -438,7 +545,7 @@ export default function SeoSettingsApp() {
       }
       // Diff against the CURRENT stored document (fresh fetch — the same
       // document the confirm-POST's presence semantics run against).
-      const fresh = await fetchConfig(routesRef.current)
+      const { config: fresh } = await fetchConfig(routesRef.current)
       setImportPreview({
         config: parsed.config,
         presentSections: parsed.presentSections,
@@ -458,6 +565,10 @@ export default function SeoSettingsApp() {
    * (present = authoritative incl. `{}` = clear — the 2.3 presence
    * semantics); sections absent from the file, INCLUDING any the server
    * knows but this client doesn't model, are carried forward untouched.
+   *
+   * Applying REPLACES the form with the imported document, so unsaved
+   * edits in any tab are lost — the caller must have confirmed that when
+   * the form is dirty (round-5 t4-30).
    */
   async function applyImport(): Promise<void> {
     if (importPreview === null) return
@@ -485,6 +596,7 @@ export default function SeoSettingsApp() {
       setForm(nextForm)
       setBaseline(nextForm)
       setImportPreview(null)
+      setConfirmDiscardEdits(false)
       setImportedFlash(true)
     } catch (err) {
       setTransferError(
@@ -539,6 +651,32 @@ export default function SeoSettingsApp() {
           Setup guide
         </Button>
       </Stack>
+
+      {decorationFailures !== undefined && (
+        // Review 2026-08-15: a publish whose SEO decoration threw ships the
+        // page with no meta, JSON-LD or analytics. The publish itself is
+        // deliberately never broken by that — but it must not be silent.
+        <Alert tone="danger" title="Some pages published without their SEO tags">
+          {decorationFailures.count === 1
+            ? '1 page published without its SEO tags '
+            : `${decorationFailures.count} pages published without their SEO tags `}
+          because the plugin hit an error while decorating them. The pages themselves are
+          fine — only the tags are missing. Republishing usually fixes it.
+          {decorationFailures.lastAt !== undefined && ` Last seen ${decorationFailures.lastAt}.`}
+          {decorationFailures.pages.length > 0 &&
+            ` Page ids: ${decorationFailures.pages.slice(0, 5).join(', ')}${
+              decorationFailures.pages.length > 5 ? '…' : ''
+            }.`}
+        </Alert>
+      )}
+
+      {indexNowFailure !== undefined && (
+        <Alert tone="danger" title="IndexNow submissions are failing">
+          {indexNowFailure.status}
+          {indexNowFailure.lastAt !== undefined && ` Last seen ${indexNowFailure.lastAt}.`}
+          {' Check the site URL and IndexNow configuration, then republish a page to retry.'}
+        </Alert>
+      )}
 
       <Tabs value={tab} onChange={setTab}>
         <TabList ariaLabel="SEO settings sections">
@@ -987,20 +1125,44 @@ export default function SeoSettingsApp() {
                   The file matches the stored settings — applying would change nothing.
                 </Text>
               )}
+              {dirty && confirmDiscardEdits && (
+                // Applying replaces the whole form with the file's document —
+                // including sections the file never touches. Two-step confirm
+                // (License.tsx precedent) so unsaved typing is never lost
+                // without being told (round-5 t4-30).
+                <Alert tone="warning" title="You have unsaved settings edits">
+                  Applying the import replaces this form with the imported settings — your
+                  unsaved edits are discarded. Cancel and save them first, or apply to
+                  discard them.
+                </Alert>
+              )}
               <Stack gap={8} direction="row" align="center">
                 <Button
                   variant="primary"
                   size="sm"
                   disabled={transferBusy || !importHasChanges(importPreview.changes)}
-                  onClick={() => void applyImport()}
+                  onClick={() => {
+                    if (dirty && !confirmDiscardEdits) {
+                      setConfirmDiscardEdits(true)
+                      return
+                    }
+                    void applyImport()
+                  }}
                 >
-                  {transferBusy ? 'Importing…' : 'Apply import'}
+                  {transferBusy
+                    ? 'Importing…'
+                    : dirty && confirmDiscardEdits
+                      ? 'Discard edits and import'
+                      : 'Apply import'}
                 </Button>
                 <Button
                   variant="ghost"
                   size="sm"
                   disabled={transferBusy}
-                  onClick={() => setImportPreview(null)}
+                  onClick={() => {
+                    setImportPreview(null)
+                    setConfirmDiscardEdits(false)
+                  }}
                 >
                   Cancel
                 </Button>
@@ -1010,7 +1172,7 @@ export default function SeoSettingsApp() {
         </Stack>
       </Card>
 
-      {/* Agent access (MCP) moved into the Connections tab (wave 3.1). */}
+      {/* Agent access (MCP) is rendered with the gated admin tabs above. */}
 
       {genericError !== null && (
         <Alert tone="danger" title="Save failed">

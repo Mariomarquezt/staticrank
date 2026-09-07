@@ -113,9 +113,29 @@ export function serializeSlugMoveRecord(record: SlugMoveRecord): Record<string, 
   }
 }
 
-/** Contract key shape: `move:<pageId>:<base36 time>`. */
+/** Per-VM monotonic counter for key uniqueness (G12: no CSPRNG in the
+ * sandbox, and none needed — uniqueness, not unpredictability). */
+let slugMoveCounter = 0
+
+/**
+ * Contract key shape: `move:<pageId>:<base36 time><counter><random>`.
+ *
+ * The time alone collided: two publish.after hooks for the SAME page inside
+ * one millisecond produced identical keys, and `listSlugMoves` dedupes by
+ * key — so one of the two observations silently disappeared from the read.
+ * The counter + random tail is the `generateRuleId` shape (store.ts), and
+ * the `move:<pageId>:` prefix stays intact so `parseSlugMoveRecordData`'s
+ * prefix check is unaffected. Base36 time keeps a fixed width until the
+ * year 5188, so key ordering still tracks creation order (the prune
+ * tie-break relies on that).
+ */
 export function slugMoveKey(pageId: string, now: number): string {
-  return `move:${pageId}:${now.toString(36)}`
+  slugMoveCounter = (slugMoveCounter + 1) % 46656 // 36^3
+  const counter = slugMoveCounter.toString(36).padStart(3, '0')
+  const rand = Math.floor(Math.random() * 2821109907456) // 36^8
+    .toString(36)
+    .padStart(8, '0')
+  return `move:${pageId}:${now.toString(36)}${counter}${rand}`
 }
 
 function slugMovesCollection(storage: SlugMoveStorageLike): SlugMoveCollectionLike {

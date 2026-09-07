@@ -22,9 +22,35 @@ export function pageUrl(siteOrigin: string, slug: string): string {
   if (slug === 'index') return `${siteOrigin}/`
   const path = slug
     .split('/')
-    .map((segment) => encodeURIComponent(segment))
+    .map((segment) => encodePathSegment(segment))
     .join('/')
   return `${siteOrigin}/${path}`
+}
+
+/** Replace only unpaired UTF-16 surrogates before URI encoding. */
+function replaceLoneSurrogates(value: string): string {
+  let result = ''
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += value.slice(index, index + 2)
+        index++
+      } else {
+        result += '\uFFFD'
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      result += '\uFFFD'
+    } else {
+      result += value.charAt(index)
+    }
+  }
+  return result
+}
+
+function encodePathSegment(segment: string): string {
+  return encodeURIComponent(replaceLoneSurrogates(segment))
 }
 
 /**
@@ -70,7 +96,7 @@ export function slugBreadcrumbs(
   ]
   let path = ''
   for (const segment of segments.slice(0, -1)) {
-    path += `/${encodeURIComponent(segment)}`
+    path += `/${encodePathSegment(segment)}`
     crumbs.push({ name: prettifySegment(segment), url: `${siteOrigin}${path}` })
   }
   const last = segments[segments.length - 1]!

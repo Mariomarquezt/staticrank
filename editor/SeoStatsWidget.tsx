@@ -23,11 +23,13 @@ import { Sparkline, StatValue, Text, Widget } from '@instatic/host-ui'
 import type { PluginDashboardWidgetRendererProps } from '../vendor-sdk'
 import { ProLock } from '../admin/ProLock'
 import { STATS_WIDGET_ID, runtimePath } from '../admin/lib/identity'
+import { LICENSE_ROUTE, proUnlockedFromResponse } from './lib/proAnalysis'
 
 export const SEO_STATS_WIDGET_ID = STATS_WIDGET_ID
 
 /** Shared identity module (review C#6) — no PluginContext on this mount. */
 const STATS_URL = runtimePath('/stats')
+const LICENSE_URL = runtimePath(LICENSE_ROUTE)
 
 interface StatsDayEntry {
   day: string
@@ -69,7 +71,7 @@ function parseStatsPayload(raw: unknown): StatsPayload | null {
 type StatsState =
   | { kind: 'loading' }
   | { kind: 'error' }
-  | { kind: 'ready'; stats: StatsPayload }
+  | { kind: 'ready'; stats: StatsPayload; proUnlocked: boolean }
 
 export function SeoStatsWidget({ span, editing }: PluginDashboardWidgetRendererProps) {
   const [state, setState] = useState<StatsState>({ kind: 'loading' })
@@ -78,11 +80,23 @@ export function SeoStatsWidget({ span, editing }: PluginDashboardWidgetRendererP
     let cancelled = false
     void (async () => {
       try {
-        const res = await fetch(STATS_URL, { credentials: 'include' })
-        if (!res.ok) throw new Error(`stats request failed with ${res.status}`)
-        const parsed = parseStatsPayload((await res.json()) as unknown)
+        const [statsRes, licenseRes] = await Promise.all([
+          fetch(STATS_URL, { credentials: 'include' }),
+          fetch(LICENSE_URL, { credentials: 'include' }),
+        ])
+        if (!statsRes.ok) throw new Error(`stats request failed with ${statsRes.status}`)
+        const parsed = parseStatsPayload((await statsRes.json()) as unknown)
+        const licenseBody = licenseRes.ok ? await licenseRes.json().catch(() => null) : null
         if (cancelled) return
-        setState(parsed === null ? { kind: 'error' } : { kind: 'ready', stats: parsed })
+        setState(
+          parsed === null
+            ? { kind: 'error' }
+            : {
+                kind: 'ready',
+                stats: parsed,
+                proUnlocked: proUnlockedFromResponse(licenseRes.ok, licenseBody),
+              },
+        )
       } catch {
         if (!cancelled) setState({ kind: 'error' })
       }
@@ -131,11 +145,22 @@ export function SeoStatsWidget({ span, editing }: PluginDashboardWidgetRendererP
                 : 'No counts yet — enable first-party analytics in SEO Settings and republish.'}
             </Text>
           )}
-          {/* §3.4 404 tease: the count is free; the per-path log is Pro. */}
-          <ProLock
-            action="Top pages & 404 log"
-            benefit="see which URLs get traffic or 404, with one-click redirects."
-          />
+          {/* §3.4 404 tease: the count is free; the per-path log is Pro.
+              Unlocked, the promised features DO exist — but in the admin
+              app, not in this widget (per-page traffic in Search Console,
+              the 404 log + one-click redirect prefill in Redirects). Point
+              there rather than letting the affordance simply vanish. */}
+          {stats.proUnlocked ? (
+            <Text variant="muted" size="sm">
+              Top pages and the 404 log are in SEO Settings — Search Console for per-page
+              traffic, Redirects for the 404 log and one-click redirects.
+            </Text>
+          ) : (
+            <ProLock
+              action="Top pages & 404 log"
+              benefit="see which URLs get traffic or 404, with one-click redirects."
+            />
+          )}
         </>
       )}
     </Widget>
