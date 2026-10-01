@@ -88,7 +88,9 @@ import {
 } from './lib/configTransfer'
 import { isConfigComplete } from './lib/wizard'
 import { SetupWizard } from './SetupWizard'
-import { ProLock } from './ProLock'
+import { RedirectsNote } from './RedirectsNote'
+import { LICENSE_ROUTE, proUnlockedFromResponse } from '../editor/lib/proAnalysis'
+import { RowField } from './RowField'
 // Pro-only tab modules. The pro-only strip markers are LINE-BASED: the free
 // build's staging step deletes every line between (and including) the
 // marker lines, so everything marked here must leave the file valid TS
@@ -306,6 +308,11 @@ export default function SeoSettingsApp() {
   const [saving, setSaving] = useState(false)
   const [savedFlash, setSavedFlash] = useState(false)
   const [reloadTick, setReloadTick] = useState(0)
+  // Presentation only (the server gates every Pro route): picks the
+  // General tab's redirect note. The free build has no /license route
+  // (404), which reads as locked — the same read the editor panel and the
+  // dashboard widget use (editor/lib/proAnalysis.ts).
+  const [proUnlocked, setProUnlocked] = useState(false)
 
   // Setup wizard (task 2.6): auto-shown ONCE per mount when setup is
   // incomplete (no usable stored siteUrl) and not previously dismissed;
@@ -336,6 +343,22 @@ export default function SeoSettingsApp() {
   // a ref so async work never captures a stale closure.
   const routesRef = useRef(routes)
   routesRef.current = routes
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await routesRef.current.fetch(LICENSE_ROUTE)
+        const body = res.ok ? await res.json().catch(() => null) : null
+        if (!cancelled) setProUnlocked(proUnlockedFromResponse(res.ok, body))
+      } catch {
+        // Network failure: stay locked (the free behavior).
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -695,7 +718,7 @@ export default function SeoSettingsApp() {
                 value={form.siteName}
                 placeholder="Acme Inc."
                 invalid={fieldErrors['site.siteName'] !== undefined}
-                description={fieldErrors['site.siteName'] ?? 'Feeds %site% in title templates.'}
+                description={fieldErrors['site.siteName'] ?? 'Feeds %site% in title templates and og:site_name.'}
                 onChange={(value) => updateForm({ siteName: value })}
               />
               <Input
@@ -716,7 +739,7 @@ export default function SeoSettingsApp() {
                 invalid={fieldErrors['site.siteUrl'] !== undefined}
                 description={
                   fieldErrors['site.siteUrl'] ??
-                  'Bare origin only (no path) — the base for canonical and og:image URLs.'
+                  'Bare origin only (no path). Every page gets a canonical and og:url at its own address under it; also the base for og:image URLs.'
                 }
                 onChange={(value) => updateForm({ siteUrl: value })}
               />
@@ -759,10 +782,7 @@ export default function SeoSettingsApp() {
                 CSV).
               </Text>
               {/* §3.4 redirect moment: manual redirects are the Pro trigger. */}
-              <ProLock
-                action="Create redirect"
-                benefit="manual 301/302/410 and regex redirects, with CSV import/export."
-              />
+              <RedirectsNote proUnlocked={proUnlocked} />
               <Separator />
               <Heading level={2}>Analytics</Heading>
               <Switch
@@ -846,22 +866,26 @@ export default function SeoSettingsApp() {
                 {form.tableRows.map((row, index) => (
                   <Stack key={row.id} gap={8}>
                     <Stack gap={8} direction="row" align="start">
-                      <Input
-                        label={index === 0 ? 'Table slug' : undefined}
-                        value={row.tableSlug}
-                        placeholder="posts"
-                        invalid={rowErrors[row.id]?.tableSlug !== undefined}
-                        description={rowErrors[row.id]?.tableSlug}
-                        onChange={(value) => updateRow(row.id, { tableSlug: value })}
-                      />
-                      <Input
-                        label={index === 0 ? 'Title template' : undefined}
-                        value={row.titleTemplate}
-                        placeholder="%title% %sep% %site%"
-                        invalid={rowErrors[row.id]?.titleTemplate !== undefined}
-                        description={rowErrors[row.id]?.titleTemplate}
-                        onChange={(value) => updateRow(row.id, { titleTemplate: value })}
-                      />
+                      <RowField>
+                        <Input
+                          label={index === 0 ? 'Table slug' : undefined}
+                          value={row.tableSlug}
+                          placeholder="posts"
+                          invalid={rowErrors[row.id]?.tableSlug !== undefined}
+                          description={rowErrors[row.id]?.tableSlug}
+                          onChange={(value) => updateRow(row.id, { tableSlug: value })}
+                        />
+                      </RowField>
+                      <RowField>
+                        <Input
+                          label={index === 0 ? 'Title template' : undefined}
+                          value={row.titleTemplate}
+                          placeholder="%title% %sep% %site%"
+                          invalid={rowErrors[row.id]?.titleTemplate !== undefined}
+                          description={rowErrors[row.id]?.titleTemplate}
+                          onChange={(value) => updateRow(row.id, { titleTemplate: value })}
+                        />
+                      </RowField>
                       <Button
                         variant="ghost"
                         size="sm"
@@ -997,22 +1021,24 @@ export default function SeoSettingsApp() {
                 )}
                 {form.sameAsRows.map((row, index) => (
                   <Stack key={row.id} gap={8} direction="row" align="start">
-                    <Input
-                      label={index === 0 ? 'Profile URL' : undefined}
-                      value={row.url}
-                      placeholder="https://www.linkedin.com/company/acme"
-                      invalid={sameAsErrors[row.id] !== undefined}
-                      description={sameAsErrors[row.id]}
-                      onChange={(value) => {
-                        setSavedFlash(false)
-                        setForm((f) => ({
-                          ...f,
-                          sameAsRows: f.sameAsRows.map((r) =>
-                            r.id === row.id ? { ...r, url: value } : r,
-                          ),
-                        }))
-                      }}
-                    />
+                    <RowField>
+                      <Input
+                        label={index === 0 ? 'Profile URL' : undefined}
+                        value={row.url}
+                        placeholder="https://www.linkedin.com/company/acme"
+                        invalid={sameAsErrors[row.id] !== undefined}
+                        description={sameAsErrors[row.id]}
+                        onChange={(value) => {
+                          setSavedFlash(false)
+                          setForm((f) => ({
+                            ...f,
+                            sameAsRows: f.sameAsRows.map((r) =>
+                              r.id === row.id ? { ...r, url: value } : r,
+                            ),
+                          }))
+                        }}
+                      />
+                    </RowField>
                     <Button
                       variant="ghost"
                       size="sm"

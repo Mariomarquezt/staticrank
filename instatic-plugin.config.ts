@@ -11,7 +11,7 @@ import { definePlugin, permissions } from './vendor-sdk'
 export default definePlugin({
   id: 'monkeywebs.seo',
   name: 'Static Rank',
-  version: '0.1.0',
+  version: '0.1.1',
   description: 'Static Rank: SEO for Instatic, baked into static HTML at publish time.',
 
   // Least-privilege: exactly what the server entrypoint uses today.
@@ -92,6 +92,10 @@ export default definePlugin({
   // is injected on every published page at body-end. It NO-OPS unless the
   // publish.html filter baked a `window.__mwSeoAnalytics` config tag into
   // the head (analytics enabled in seo-config), and respects DNT/GPC.
+  // The host cannot make the tag conditional, so the publish.html filter
+  // (which runs AFTER the host's splice) REMOVES it again whenever it bakes
+  // no config tag — analytics off costs no request (`stripTrackerTag`,
+  // server/analytics.ts). `src` must stay equal to TRACKER_ASSET_PATH there.
   // Beacons POST same-origin (connect-src 'self') — no networkAllowedHosts
   // entry needed.
   frontend: {

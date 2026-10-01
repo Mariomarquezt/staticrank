@@ -165,7 +165,7 @@ export function buildSetupAudit(config: SeoConfigData): SetupAuditItem[] {
       label: 'Site URL',
       ok: siteUrlOk,
       detail: siteUrlOk
-        ? 'Configured — canonicals, the sitemap, and IndexNow will use this origin.'
+        ? 'Configured — every page gets a self-referencing canonical; the sitemap and IndexNow use this origin too.'
         : 'Not set — canonicals, the sitemap, and IndexNow stay disabled without it.',
     },
     {
@@ -173,7 +173,7 @@ export function buildSetupAudit(config: SeoConfigData): SetupAuditItem[] {
       label: 'Site name',
       ok: siteNameOk,
       detail: siteNameOk
-        ? 'Configured — feeds %site% in title templates.'
+        ? 'Configured — feeds %site% in title templates and og:site_name.'
         : 'Not set — %site% renders empty in title templates.',
     },
     {

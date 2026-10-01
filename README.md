@@ -12,7 +12,9 @@ Plugin id: `monkeywebs.seo`
 - **Meta engine** — per-entry title, meta description, canonical, robots,
   Open Graph and Twitter tags, baked into the published HTML at publish
   time. Title templates with `%title%` / `%site%` / `%sep%` placeholders,
-  per-table defaults, and site-wide fallbacks.
+  per-table defaults, and site-wide fallbacks. Once the site URL is set,
+  every indexable page gets a self-referencing canonical and `og:url`
+  automatically; a stored canonical overrides it.
 - **Editor SEO panel** — live preview of the Google result, a readability
   and on-page analysis, and character counts that tell you when a title or
   description will be truncated.
@@ -23,7 +25,7 @@ Plugin id: `monkeywebs.seo`
 - **First-party analytics** — daily page-view and 404 counts from a small
   script, no third parties, no cookies, no visitor identifiers, no IP
   storage, and Do Not Track / Global Privacy Control respected. Off by
-  default.
+  default, and while it is off no script is loaded at all.
 - **Site verification tags** for Google, Bing and Pinterest.
 - **Setup wizard**, dashboard widget, ⌘K commands, settings export/import.
 - **Slug-move visibility** — when a page is renamed, Instatic mints the

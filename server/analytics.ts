@@ -3,8 +3,9 @@
  *
  * Design (spike G6 + G7): the browser tracker (`assets/tracker.js`, shipped
  * as a static manifest `frontend.assets[]` script — vendor
- * server/publish/frontendInjections.ts:106-165) POSTs a small text/plain
- * JSON beacon to the plugin's PUBLIC runtime routes:
+ * server/publish/frontendInjections.ts:106-165; the publish.html filter
+ * strips the tag again while analytics is off, see `stripTrackerTag`) POSTs
+ * a small text/plain JSON beacon to the plugin's PUBLIC runtime routes:
  *
  *   POST /admin/api/cms/plugins/<id>/runtime/beacon      — page views
  *   POST /admin/api/cms/plugins/<id>/runtime/beacon404   — 404 hits
@@ -482,6 +483,60 @@ export function buildAnalyticsConfigTag(config: {
   }).replace(/</g, '\\u003c')
   const scriptText = `window.__mwSeoAnalytics=${json};`
   return { tag: `<script>${scriptText}</script>`, scriptText }
+}
+
+// ---------------------------------------------------------------------------
+// Tracker tag — removing the host-injected script when analytics is off
+// ---------------------------------------------------------------------------
+
+/** Package-relative tracker path — must match `frontend.assets[]` in the manifest. */
+export const TRACKER_ASSET_PATH = 'assets/tracker.js'
+
+/** The host's own attribute escape (vendor frontendInjections.ts `escapeAttr`). */
+function escapeHostAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+/**
+ * The tracker `<script>` tag EXACTLY as the host renders this plugin's
+ * manifest asset (vendor server/publish/frontendInjections.ts `renderAsset`,
+ * kind 'script', strategy 'defer', no extra attrs):
+ * `<script src="<assetUrl>" defer data-plugin-id="<id>"></script>`.
+ * `assetUrl` is `api.plugin.assetUrl(TRACKER_ASSET_PATH)`.
+ */
+export function trackerScriptTag(assetUrl: string, pluginId: string): string {
+  return `<script src="${escapeHostAttr(assetUrl)}" defer data-plugin-id="${escapeHostAttr(pluginId)}"></script>`
+}
+
+/**
+ * Remove the host-injected tracker tag from a published document.
+ *
+ * Why: `frontend.assets[]` is manifest-static — the host splices the tag
+ * into EVERY page of every site whether or not analytics is on (spike G6;
+ * it has no per-site or per-page condition). The tracker returns at once
+ * without the baked config tag, but the browser still pays one request per
+ * page for it. The host runs the `publish.html` filter AFTER that splice
+ * (publishedHtmlPipeline.ts stages 2 → 3), so the filter drops the tag
+ * whenever it is not also baking the config tag the tracker needs.
+ *
+ * Exact-string match on the host's rendered tag, for this plugin's id and
+ * asset URL only: nothing else in the document can be touched, and a host
+ * that ever renders the tag differently simply stops matching — the page
+ * keeps the (inert) script, which is the pre-existing behaviour. The host
+ * joins tags with `\n`, so one following newline goes with the tag and
+ * the spot is byte-identical to a document the host never injected into.
+ * The CSP `script-src 'self'` the host added for the asset is left alone.
+ */
+export function stripTrackerTag(html: string, assetUrl: string, pluginId: string): string {
+  if (assetUrl === '' || pluginId === '') return html
+  const tag = trackerScriptTag(assetUrl, pluginId)
+  if (!html.includes(tag)) return html
+  return html.split(`${tag}\n`).join('').split(tag).join('')
 }
 
 /** Public beacon route paths (registered in server/index.ts). */

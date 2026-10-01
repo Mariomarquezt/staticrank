@@ -106,7 +106,6 @@ export function SeoStatsWidget({ span, editing }: PluginDashboardWidgetRendererP
     }
   }, [])
 
-  const stats = state.kind === 'ready' ? state.stats : null
   return (
     <Widget
       widgetId={SEO_STATS_WIDGET_ID}
@@ -121,48 +120,65 @@ export function SeoStatsWidget({ span, editing }: PluginDashboardWidgetRendererP
           Could not load traffic counts.
         </Text>
       )}
-      {stats !== null && (
-        <>
-          <StatValue value={stats.totals.views} sub="page views · last 7 days" />
-          {stats.days.length >= 2 && (
-            <Sparkline data={stats.days.map((d) => d.views)} tint="var(--tint)" />
-          )}
-          <Text variant="muted" size="sm">
-            {stats.totals.notFound} not-found hit{stats.totals.notFound === 1 ? '' : 's'} this
-            week
-          </Text>
-          {!stats.collecting && (stats.totals.views > 0 || stats.totals.notFound > 0) && (
-            // C#3: day records outlive a disable (30-day retention) — label
-            // them so paused analytics never reads as live traffic.
-            <Text variant="muted" size="sm">
-              Analytics is paused — showing historical data.
-            </Text>
-          )}
-          {stats.totals.views === 0 && stats.totals.notFound === 0 && (
-            <Text variant="muted" size="sm">
-              {stats.collecting
-                ? 'No counts yet — data appears after the next publish once pages get visits.'
-                : 'No counts yet — enable first-party analytics in SEO Settings and republish.'}
-            </Text>
-          )}
-          {/* §3.4 404 tease: the count is free; the per-path log is Pro.
-              Unlocked, the promised features DO exist — but in the admin
-              app, not in this widget (per-page traffic in Search Console,
-              the 404 log + one-click redirect prefill in Redirects). Point
-              there rather than letting the affordance simply vanish. */}
-          {stats.proUnlocked ? (
-            <Text variant="muted" size="sm">
-              Top pages and the 404 log are in SEO Settings — Search Console for per-page
-              traffic, Redirects for the 404 log and one-click redirects.
-            </Text>
-          ) : (
-            <ProLock
-              action="Top pages & 404 log"
-              benefit="see which URLs get traffic or 404, with one-click redirects."
-            />
-          )}
-        </>
+      {state.kind === 'ready' && (
+        <StatsDetails stats={state.stats} proUnlocked={state.proUnlocked} />
       )}
     </Widget>
+  )
+}
+
+/**
+ * The ready-state body. `proUnlocked` is a separate typed prop because it
+ * lives on the fetch STATE, not on the stats payload: the widget once read
+ * `stats.proUnlocked` (always undefined) and so showed the Pro lock even
+ * with Pro active (found 2026-09-30).
+ */
+export function StatsDetails({
+  stats,
+  proUnlocked,
+}: {
+  stats: StatsPayload
+  proUnlocked: boolean
+}) {
+  return (
+    <>
+      <StatValue value={stats.totals.views} sub="page views · last 7 days" />
+      {stats.days.length >= 2 && (
+        <Sparkline data={stats.days.map((d) => d.views)} tint="var(--tint)" />
+      )}
+      <Text variant="muted" size="sm">
+        {stats.totals.notFound} not-found hit{stats.totals.notFound === 1 ? '' : 's'} this week
+      </Text>
+      {!stats.collecting && (stats.totals.views > 0 || stats.totals.notFound > 0) && (
+        // C#3: day records outlive a disable (30-day retention) — label
+        // them so paused analytics never reads as live traffic.
+        <Text variant="muted" size="sm">
+          Analytics is paused — showing historical data.
+        </Text>
+      )}
+      {stats.totals.views === 0 && stats.totals.notFound === 0 && (
+        <Text variant="muted" size="sm">
+          {stats.collecting
+            ? 'No counts yet — data appears after the next publish once pages get visits.'
+            : 'No counts yet — enable first-party analytics in SEO Settings and republish.'}
+        </Text>
+      )}
+      {/* §3.4 404 tease: the count is free; the per-path log is Pro.
+          Unlocked, the promised features DO exist — but in the admin
+          app, not in this widget (per-page traffic in Search Console,
+          the 404 log + one-click redirect prefill in Redirects). Point
+          there rather than letting the affordance simply vanish. */}
+      {proUnlocked ? (
+        <Text variant="muted" size="sm">
+          Top pages and the 404 log are in SEO Settings — Search Console for per-page traffic,
+          Redirects for the 404 log and one-click redirects.
+        </Text>
+      ) : (
+        <ProLock
+          action="Top pages & 404 log"
+          benefit="see which URLs get traffic or 404, with one-click redirects."
+        />
+      )}
+    </>
   )
 }

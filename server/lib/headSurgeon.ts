@@ -560,6 +560,52 @@ function findDescriptionMetas(head: string, masks: Mask[]): ParsedMetaTag[] {
   return found
 }
 
+/**
+ * Does the head already carry a `<link rel="canonical">` the plugin did NOT
+ * write? The plugin's own marker blocks are removed first (re-filtering our
+ * own output must not see the canonical a previous run emitted); comments,
+ * script/style/noscript bodies and the `<title>` text are opaque, the same
+ * masking the description scan uses. `rel` is a space-separated token list,
+ * matched case-insensitively.
+ *
+ * Feeds the DEFAULT self-referencing canonical only (server/metaBlock.ts):
+ * the host emits no canonical at this pin, but a page author can — and two
+ * canonicals in one head make crawlers ignore both.
+ */
+export function hasForeignCanonical(html: string): boolean {
+  const headClose = findHeadClose(html)
+  if (headClose === -1) return false
+  const head = removeSeoBlocks(html.slice(0, headClose))
+  const baseMasks = computeMasks(head)
+  const title = findTitle(head, baseMasks)
+  const masks: Mask[] = title ? [...baseMasks, [title.tagStart, title.tagEnd]] : baseMasks
+  const lower = head.toLowerCase()
+  let i = 0
+  while (i < head.length) {
+    const lt = head.indexOf('<', i)
+    if (lt === -1) break
+    const mask = maskAt(masks, lt)
+    if (mask !== undefined) {
+      i = mask[1]
+      continue
+    }
+    if (!isOpeningTagAt(lower, lt, 'link')) {
+      i = closedTagEnd(head, lower, lt) ?? lt + 1
+      continue
+    }
+    // `<link` is as long as `<meta`, so the meta tokenizer reads it as-is.
+    const parsed = parseMetaTag(head, lt)
+    if (!parsed) break
+    i = parsed.end
+    if (isMasked(masks, parsed.start, parsed.end)) continue
+    const rel = parsed.attrs.find((a) => a.name.toLowerCase() === 'rel')
+    if (rel && rel.value !== null && rel.value.toLowerCase().split(/\s+/).includes('canonical')) {
+      return true
+    }
+  }
+  return false
+}
+
 function isWsCode(code: number): boolean {
   return code === 32 || code === 9 || code === 10 || code === 12 || code === 13
 }

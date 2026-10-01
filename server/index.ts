@@ -23,6 +23,7 @@ import {
   NOTFOUND_RATE_PER_MIN,
   SEO_ANALYTICS_RESOURCE_ID,
   SEO_NOTFOUND_RESOURCE_ID,
+  TRACKER_ASSET_PATH,
   TokenBucket,
   beaconEndpoint,
   beaconPath,
@@ -33,6 +34,7 @@ import {
   newestDayTotals,
   pruneExpiredDayRecords,
   serializeDayCounts,
+  stripTrackerTag,
   type DayCollectionLike,
   type DrainedDay,
 } from './analytics'
@@ -978,10 +980,29 @@ const mod: ServerPluginModule = {
             working = patched
           }
         }
+        // No config tag baked (analytics off, or its CSP hash could not be
+        // added) = the tracker has nothing to run on. The host spliced its
+        // manifest `<script>` in regardless (assets are unconditional —
+        // G6), so drop it here rather than cost every page one request.
+        if (analyticsTag === undefined) {
+          try {
+            working = stripTrackerTag(
+              working,
+              api.plugin.assetUrl(TRACKER_ASSET_PATH),
+              api.plugin.id,
+            )
+          } catch {
+            // an optimisation must never affect the published document
+          }
+        }
 
         const composed = composePublishHtml(working, entry, config, {
           tableSlug: tpl.targetTableSlug ?? PAGES_TABLE_SLUG,
           slug,
+          // Default self-referencing canonical: regular pages only — a
+          // template pageId means a data-row or notFound render carrying
+          // the TEMPLATE's slug (G1), never a URL of this document.
+          regularPage: !tpl.isTemplate,
           schemaPage: tpl.isTemplate
             ? undefined
             : { datePublished: tpl.createdAt, dateModified: tpl.updatedAt },

@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import { applySeoHead, escapeAttr, escapeHtml, type SeoHeadPayload } from '../headSurgeon'
+import {
+  applySeoHead,
+  escapeAttr,
+  escapeHtml,
+  hasForeignCanonical,
+  type SeoHeadPayload,
+} from '../headSurgeon'
 
 const BLOCK =
   '<link rel="canonical" href="https://example.com/page/">\n' +
@@ -444,5 +450,57 @@ describe('performance sanity', () => {
     expect(tail(once)).toBe(tail(input))
     // generous sanity bound, not a benchmark
     expect(elapsed).toBeLessThan(1000)
+  })
+})
+
+describe('hasForeignCanonical', () => {
+  const doc = (head: string) => `<html><head><title>T</title>${head}</head><body></body></html>`
+
+  test('finds a canonical link in the head, whatever the attribute style', () => {
+    expect(hasForeignCanonical(doc('<link rel="canonical" href="https://e.com/a">'))).toBe(true)
+    expect(hasForeignCanonical(doc("<LINK HREF='/a' REL='Canonical' />"))).toBe(true)
+    expect(hasForeignCanonical(doc('<link href=/a rel=canonical>'))).toBe(true)
+    expect(hasForeignCanonical(doc('<link rel="alternate canonical" href="/a">'))).toBe(true)
+  })
+
+  test('other link tags are not a canonical', () => {
+    expect(hasForeignCanonical(doc('<link rel="stylesheet" href="/canonical.css">'))).toBe(false)
+    expect(hasForeignCanonical(doc('<link rel="icon" href="/f.svg" title="rel=canonical">'))).toBe(
+      false,
+    )
+    expect(hasForeignCanonical(doc('<link rel="noncanonical" href="/a">'))).toBe(false)
+    expect(hasForeignCanonical(doc(''))).toBe(false)
+  })
+
+  test('the plugin\'s own block does not count (re-filtering its output)', () => {
+    const own = doc(
+      '<!--seo:start-->\n<link rel="canonical" href="https://e.com/a">\n<!--seo:end-->\n',
+    )
+    expect(hasForeignCanonical(own)).toBe(false)
+    expect(
+      hasForeignCanonical(own.replace('<!--seo:start-->', '<link rel="canonical" href="/b"><!--seo:start-->')),
+    ).toBe(true)
+  })
+
+  test('decoys in comments, scripts, the title and the body are ignored', () => {
+    expect(hasForeignCanonical(doc('<!-- <link rel="canonical" href="/a"> -->'))).toBe(false)
+    expect(
+      hasForeignCanonical(doc('<script>const s = \'<link rel="canonical" href="/a">\'</script>')),
+    ).toBe(false)
+    expect(
+      hasForeignCanonical(
+        '<html><head><title><link rel="canonical" href="/a"></title></head><body></body></html>',
+      ),
+    ).toBe(false)
+    expect(
+      hasForeignCanonical(
+        '<html><head><title>T</title></head><body><link rel="canonical" href="/a"></body></html>',
+      ),
+    ).toBe(false)
+  })
+
+  test('no head, or an unterminated link tag → false, never a throw', () => {
+    expect(hasForeignCanonical('<p>no head</p>')).toBe(false)
+    expect(hasForeignCanonical(doc('<link rel="canonical'))).toBe(false)
   })
 })

@@ -140,7 +140,7 @@ export function SetupWizard(props: SetupWizardProps) {
               value={props.form.siteName}
               placeholder="Acme Inc."
               invalid={err('site.siteName') !== undefined}
-              description={err('site.siteName') ?? 'Feeds %site% in title templates.'}
+              description={err('site.siteName') ?? 'Feeds %site% in title templates and og:site_name.'}
               onChange={(value) => props.updateForm({ siteName: value })}
             />
             <Input

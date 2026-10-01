@@ -140,6 +140,7 @@ import {
   type AiStatusView,
   type SuggestField,
 } from './lib/aiSuggest'
+import { SuggestionOption } from './SuggestionOption'
 
 /** Table slug the site editor's entries live in (pages ARE data rows). */
 const PAGES_TABLE_SLUG = 'pages'
@@ -809,14 +810,11 @@ function SuggestControl({
       {mine?.kind === 'ready' && (
         <Stack gap={4}>
           {mine.suggestions.map((suggestion, index) => (
-            <Button
+            <SuggestionOption
               key={`${field}:${index}:${suggestion}`}
-              variant="secondary"
-              size="sm"
-              onClick={() => onPick(field, suggestion)}
-            >
-              {suggestion}
-            </Button>
+              text={suggestion}
+              onPick={(value) => onPick(field, value)}
+            />
           ))}
           <Text variant="muted" size="sm">
             Click a suggestion to fill the field — then Save to keep it.

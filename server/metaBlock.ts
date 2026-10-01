@@ -24,6 +24,24 @@
  *   relative canonical with no configured site URL is NOT emitted (a
  *   relative canonical is close to meaningless to crawlers, and guessing
  *   an origin would be worse). Same resolution applies to og:image.
+ * - DEFAULT self-referencing canonical (2026-10-01): an entry that stores
+ *   NO canonical gets the page's own absolute URL — `pageUrl(origin,
+ *   slug)`, the exact URL the sitemap `<loc>` and the schema.org WebPage
+ *   carry — when ALL hold: a site origin is configured (never guess one),
+ *   the render is a regular page baked at its own slug (`selfUrl` in the
+ *   context — template / data-row / notFound renders carry the TEMPLATE's
+ *   slug and get none), and the page is not noindex (a noindexed page is
+ *   not in the sitemap either; a STORED canonical still emits beside
+ *   noindex exactly as before). See `resolveCanonical`. One more guard in
+ *   `composePublishHtml`: a head that already carries a canonical the
+ *   plugin did not write gets no default (`hasForeignCanonical`).
+ * - `og:url` = the resolved canonical, and `og:type` = `website`, ride
+ *   along whenever a canonical resolves (stored or default) and never
+ *   otherwise: the plugin only names a page's URL when it knows it, and
+ *   `website` is the Open Graph protocol's own default type — stating it
+ *   beside a known URL adds no guessed data.
+ * - `og:site_name` whenever the site name is configured (site-wide
+ *   stored data, so it is emitted on every render kind).
  * - `<meta name="robots">` only when noindex or nofollow is TRUE.
  *   Absent flags and explicit `false` emit nothing — indexability is the
  *   default and is never degraded by omission (task rule 4).
@@ -42,11 +60,18 @@
  */
 
 import type { SeoHeadPayload } from './lib/headSurgeon'
-import { applySeoHead, escapeAttr, findCommentEnd, findHeadClose } from './lib/headSurgeon'
+import {
+  applySeoHead,
+  escapeAttr,
+  findCommentEnd,
+  findHeadClose,
+  hasForeignCanonical,
+} from './lib/headSurgeon'
 import { pageUrl, slugBreadcrumbs } from './lib/pageUrl'
 import { buildSchemaGraph } from './lib/schemaGraph'
 import { renderTemplate } from './lib/templateEngine'
 import type { SeoMetaPayload } from './seoMeta'
+import { SITEMAP_ENTRY_MAX_CHARS } from './sitemap'
 // Type-only: a VALUE import from seoConfig would create an import cycle
 // (seoConfig imports normalizeSiteOrigin/TITLE_TEMPLATE_VARS from here).
 // The schema-enabled default is therefore checked inline below. Configs
@@ -80,6 +105,16 @@ export interface PageSeoContext {
    * canonical / og:image values. Absent = relative values are dropped.
    */
   siteUrl?: string
+  /**
+   * The page's OWN absolute public URL (`selfCanonicalUrl`). Present ONLY
+   * for a regular page render on a site with a configured origin; arms
+   * the default self-referencing canonical for entries that store none.
+   * Absent = no default (template / data-row / notFound renders, no site
+   * origin, legacy callers) — byte-identical pre-default output.
+   */
+  selfUrl?: string
+  /** Site name from the site defaults → `og:site_name`. Absent = no tag. */
+  siteName?: string
   /**
    * The ORIGINAL page title the `%title%` template variable rendered
    * from, stashed as an escaped `<!--seo:source-title:…-->` comment
@@ -161,6 +196,54 @@ export function resolveAbsoluteUrl(
   const origin = normalizeSiteOrigin(siteUrl)
   if (origin === undefined) return undefined
   return origin + value
+}
+
+/**
+ * The absolute URL a regular page is published at, or undefined when it
+ * cannot be named: no (valid) site origin, an empty slug, or a slug past
+ * `SITEMAP_ENTRY_MAX_CHARS` (the sitemap skips those entries, and the
+ * canonical must never name a URL the sitemap refuses to list). Uses the
+ * SHARED `pageUrl` mapping, so the homepage form (`index` → `<origin>/`),
+ * the no-trailing-slash rule for every other page and the per-segment
+ * encoding are identical to the sitemap `<loc>` and the schema.org
+ * WebPage url. Callers pass it ONLY for regular page renders.
+ */
+export function selfCanonicalUrl(siteUrl: string | undefined, slug: string): string | undefined {
+  const origin = normalizeSiteOrigin(siteUrl)
+  if (origin === undefined) return undefined
+  if (slug === '' || slug.length > SITEMAP_ENTRY_MAX_CHARS) return undefined
+  return pageUrl(origin, slug)
+}
+
+/** A canonical that will be emitted, and where it came from. */
+export interface ResolvedCanonical {
+  url: string
+  /** `entry` = the stored per-entry canonical; `self` = the default. */
+  source: 'entry' | 'self'
+}
+
+/**
+ * The ONE canonical decision (publish filter + MCP reporting share it):
+ *
+ *   1. A stored canonical that resolves wins, always (noindex included).
+ *   2. A stored canonical that does NOT resolve (relative, no site
+ *      origin) emits nothing — the operator named another URL, so the
+ *      page's own URL is not substituted for it.
+ *   3. Nothing stored: the page's own URL (`ctx.selfUrl`), unless the
+ *      page is noindex — "do not index this" and "this is the URL to
+ *      index" contradict each other, and the sitemap drops the page too.
+ */
+export function resolveCanonical(
+  merged: SeoMetaPayload,
+  ctx: { siteUrl?: string; selfUrl?: string },
+): ResolvedCanonical | undefined {
+  if (nonEmpty(merged.canonical) !== undefined) {
+    const stored = resolveAbsoluteUrl(merged.canonical, ctx.siteUrl)
+    return stored !== undefined ? { url: stored, source: 'entry' } : undefined
+  }
+  if (merged.robots?.noindex === true) return undefined
+  const self = nonEmpty(ctx.selfUrl)
+  return self !== undefined ? { url: self, source: 'self' } : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +396,17 @@ function normalizeTitle(text: string): string {
 }
 
 /**
+ * Fingerprint text for the title-fp stash comment. Must match what
+ * `extractTitleText` returns for the same decorated `<title>`: normalize
+ * then clamp to TITLE_TEXT_MAX. Titles that differ only after the clamp
+ * share a fingerprint by design — the clamp bounds work/storage and
+ * `extractTitleText` already collapses them on read.
+ */
+function titleFingerprintText(text: string): string {
+  return clampCodePoints(normalizeTitle(text), TITLE_TEXT_MAX)
+}
+
+/**
  * [start, end) ranges of head content that is OPAQUE to the marker scan:
  * ordinary HTML comments and the full extent of script/style/noscript
  * elements. The marker comments themselves are never masked — they are the
@@ -452,7 +546,10 @@ export function resolveSourceTitle(html: string): string | undefined {
   if (stash === undefined) return currentTitle
   const fingerprint = readStashComment(blockBody, TITLE_FP_OPEN)
   if (fingerprint === undefined) return currentTitle
-  if (currentTitle === undefined || normalizeTitle(currentTitle) !== fingerprint) {
+  if (
+    currentTitle === undefined ||
+    titleFingerprintText(currentTitle) !== titleFingerprintText(fingerprint)
+  ) {
     // Title edited (or removed) since we decorated it — stash is stale.
     return currentTitle
   }
@@ -476,7 +573,11 @@ export function resolveSourceTitle(html: string): string | undefined {
  * - `metaDescription`: per-entry → site default description.
  * - `canonical`, `robots`, `ogTitle`, `ogDescription`, `ogImage`,
  *   `twitterCard`: per-entry only — never templated, never defaulted
- *   (robots especially: rule 4, indexable by default).
+ *   (robots especially: rule 4, indexable by default). The DEFAULT
+ *   self-referencing canonical is deliberately NOT merged in here: it is
+ *   an emission-time decision (`resolveCanonical`), so the merged payload
+ *   stays "what is stored" and a read-modify-write of it can never freeze
+ *   today's URL into a stored override that goes stale on a slug rename.
  */
 export function mergeSeoMeta(
   entry: SeoMetaPayload,
@@ -546,13 +647,13 @@ export function buildSeoHeadPayload(
     // while the fingerprint still matches the document's live <title> —
     // see its doc comment (stale-stash / forgery guards).
     parts.push(`${SOURCE_TITLE_OPEN}${escapeAttr(normalizeTitle(ctx.sourceTitle))}${COMMENT_CLOSE}`)
-    parts.push(`${TITLE_FP_OPEN}${escapeAttr(normalizeTitle(title ?? ''))}${COMMENT_CLOSE}`)
+    parts.push(`${TITLE_FP_OPEN}${escapeAttr(titleFingerprintText(title ?? ''))}${COMMENT_CLOSE}`)
   }
 
   const description = nonEmpty(merged.metaDescription)
   if (description !== undefined) payload.metaDescription = description
 
-  const canonical = resolveAbsoluteUrl(merged.canonical, ctx.siteUrl)
+  const canonical = resolveCanonical(merged, ctx)?.url
   if (canonical !== undefined) {
     parts.push(`<link rel="canonical" href="${escapeAttr(canonical)}">`)
   }
@@ -575,6 +676,14 @@ export function buildSeoHeadPayload(
   }
   if (ogImage !== undefined) {
     parts.push(`<meta property="og:image" content="${escapeAttr(ogImage)}">`)
+  }
+  if (canonical !== undefined) {
+    parts.push(`<meta property="og:url" content="${escapeAttr(canonical)}">`)
+    parts.push('<meta property="og:type" content="website">')
+  }
+  const siteName = nonEmpty(ctx.siteName)
+  if (siteName !== undefined) {
+    parts.push(`<meta property="og:site_name" content="${escapeAttr(siteName)}">`)
   }
 
   if (merged.twitterCard !== undefined) {
@@ -600,6 +709,16 @@ export interface ComposeContext {
   tableSlug: string
   /** Slug from the filter context. */
   slug: string
+  /**
+   * True ONLY for regular (non-template) page renders: the page is baked
+   * at its own slug, so `pageUrl(origin, slug)` IS its public URL. Arms
+   * the default self-referencing canonical (+ og:url / og:type). Template
+   * renders — data rows AND the notFound/404 template — carry the
+   * TEMPLATE page's slug (G1), which is not a public URL of the document
+   * being rendered, so they must leave this unset. Same condition the
+   * filter uses for `schemaPage` and for sitemap tracking.
+   */
+  regularPage?: boolean
   /**
    * Present ONLY for regular (non-template) page renders: arms schema.org
    * JSON-LD graph emission for this page (task 2.3), still subject to
@@ -732,7 +851,8 @@ export function buildSchemaTag(
  * page name reads the merged title first — never the re-templated
  * document title. With nothing stored anywhere (and no site origin
  * configured) the document passes through byte-identical (applySeoHead's
- * empty-payload no-op).
+ * empty-payload no-op). A configured origin alone is enough to emit on a
+ * regular page: the default canonical + og:url + og:type.
  */
 export function composePublishHtml(
   html: string,
@@ -750,8 +870,15 @@ export function composePublishHtml(
   // (no per-entry title, but a title was produced): only then does the next
   // run need the pre-template source to keep %title% stable.
   const titleFromTemplate = nonEmpty(entry.title) === undefined && merged.title !== undefined
+  const selfUrl =
+    ctx.regularPage === true ? selfCanonicalUrl(config.site?.siteUrl, ctx.slug) : undefined
   const payload = buildSeoHeadPayload(merged, {
     siteUrl: config.site?.siteUrl,
+    // A canonical the page author put in the head stands: the DEFAULT never
+    // adds a second one (a STORED canonical is the operator's explicit call
+    // and still emits, as it always has).
+    selfUrl: selfUrl !== undefined && !hasForeignCanonical(html) ? selfUrl : undefined,
+    siteName: config.site?.siteName,
     sourceTitle: titleFromTemplate ? sourceTitle ?? '' : undefined,
   })
   // When no merged title is emitted, the FINAL head title is whatever the
