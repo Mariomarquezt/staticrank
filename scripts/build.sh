@@ -65,6 +65,6 @@ if [[ "$MODE" == "build" ]]; then
   (cd "$WORK/dist" && zip -qr "$WORK.plugin.zip" assets)
   rm -rf "$REPO/dist"
   cp -R "$WORK/dist" "$REPO/dist"
-  cp "$WORK.plugin.zip" "$REPO/vantage-seo.plugin.zip"
-  echo "built -> $REPO/dist and $REPO/vantage-seo.plugin.zip"
+  cp "$WORK.plugin.zip" "$REPO/staticrank.plugin.zip"
+  echo "built -> $REPO/dist and $REPO/staticrank.plugin.zip"
 fi

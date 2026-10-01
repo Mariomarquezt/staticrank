@@ -1,4 +1,4 @@
-# Vantage SEO — free edition
+# Static Rank — free edition
 
 An SEO plugin for [Instatic](https://github.com/CoreBunch/Instatic), the
 self-hosted static-HTML CMS. This repository is the **free edition**, MIT
@@ -44,7 +44,7 @@ INSTATIC=/path/to/your/Instatic scripts/build.sh lint
 INSTATIC=/path/to/your/Instatic scripts/build.sh build
 ```
 
-That writes `dist/` and `vantage-seo.plugin.zip`.
+That writes `dist/` and `staticrank.plugin.zip`.
 
 Run the tests with [Bun](https://bun.sh):
 

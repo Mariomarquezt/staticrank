@@ -10,9 +10,9 @@ import { definePlugin, permissions } from './vendor-sdk'
 
 export default definePlugin({
   id: 'monkeywebs.seo',
-  name: 'Seo',
+  name: 'Static Rank',
   version: '0.1.0',
-  description: 'A Seo content-editor plugin (reads + writes CMS entries).',
+  description: 'Static Rank: SEO for Instatic, baked into static HTML at publish time.',
 
   // Least-privilege: exactly what the server entrypoint uses today.
   //   - cms.content.read + a contentAccess allowlist return in task 1.4
