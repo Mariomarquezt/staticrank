@@ -11,7 +11,7 @@ import { definePlugin, permissions } from './vendor-sdk'
 export default definePlugin({
   id: 'monkeywebs.seo',
   name: 'Static Rank',
-  version: '0.1.1',
+  version: '0.1.2',
   description: 'Static Rank: SEO for Instatic, baked into static HTML at publish time.',
 
   // Least-privilege: exactly what the server entrypoint uses today.
